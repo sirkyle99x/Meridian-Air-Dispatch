@@ -61,7 +61,7 @@ PAX_ALLOWANCE_LB = 230       # 175 body + 55 bag
 BAG_PER_PAX_LB = 55
 
 # Overhead anchors: (gc_nm, hours). Linear interpolation between; flat outside.
-OVERHEAD_ANCHORS = [(50.0, 0.40), (175.0, 0.30), (375.0, 0.20), (600.0, 0.15)]
+OVERHEAD_ANCHORS = [(50.0, 0.26), (175.0, 0.26), (375.0, 0.26), (600.0, 0.26)]
 
 SIMBRIEF_URL = (
     "https://dispatch.simbrief.com/options/custom"
