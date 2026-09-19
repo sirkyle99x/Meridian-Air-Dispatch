@@ -55,7 +55,7 @@ from zoneinfo import ZoneInfo
 
 ROUTE_FACTOR = 1.07          # FLIGHT TIME CALCULATION
 TAXI_H = 0.25                # 8 min out + 7 min in
-PREP_H = 0.25                # session time = block + prep
+PREP_H = 0.35                # session time = block + prep
 CEILING_MARGIN_H = 0.5       # block ceiling = availability - 30 min, every length
 PAX_ALLOWANCE_LB = 230       # 175 body + 55 bag
 BAG_PER_PAX_LB = 55
