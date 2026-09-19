@@ -164,31 +164,84 @@ AFFINITY_BONUS = 10          # destination region in the class's affinity list
 MODEL_ROTATION_PENALTY = -15 # same model as the last logged flight
 EVENT_VERIFIED_BONUS = 25    # applied by Dispatch, not by this script
 
-# Fullness anchors: (block/ceiling, points). Linear interpolation between,
-# flat below the first. Same treatment as OVERHEAD_ANCHORS and for the same
-# reason: the v4.2 step bands scored a 99%-full leg and an 86%-full leg
-# identically at +20, so on a large candidate pool every strong candidate tied
-# at the top and the tie-break fell to TYPE_RANK — airport size, which pulls
-# toward hubs exactly when the Class B restriction is pushing toward relievers.
-# The band values survive as the anchors; only the steps between them are gone.
-# VARIETY ENGINE's stated default is to make real use of the time Kyle gave it,
-# and a monotonic curve is what actually expresses that.
-FULLNESS_ANCHORS = [(0.50, -25.0), (0.60, -10.0), (0.78, 10.0), (1.00, 20.0)]
+# Fullness band, in ABSOLUTE minutes against the ceiling — not a fraction of it.
+# Kyle's tolerance is "15 minutes short is fine, 5 minutes over is fine" and that
+# does not scale with session length: 15 min short of a 3h ceiling and 15 min
+# short of a 90 min ceiling are the same concession to him, while 0.92 x ceiling
+# is two different concessions. The v6.3 monotonic curve was proportional and
+# collapsed a 20-minute tolerance into a ~2-minute slice: on a 3h ceiling every
+# reported candidate landed between 177.7 and 179.9 minutes, so the engine chose
+# among ~235 legal fields by a margin Kyle cannot perceive, and the 12 it
+# surfaced were whichever ones sat nearest the ceiling radius by geographic
+# accident.
+#
+# Inside the band every candidate scores the same, and DESTINATION QUALITY below
+# does the discriminating. That is the v4.2 failure mode inverted rather than
+# repeated: v4.2's step bands tied at the top and fell through to TYPE_RANK,
+# which pulled toward hubs; here the tie-break is an explicit quality term that
+# ranks medium_airport ABOVE large_airport, so it pulls toward relievers.
+BAND_UNDER_H = 0.25          # 15 min: full credit this far under the ceiling
+BAND_OVER_H = 5.0 / 60.0     # 5 min: allowed to exceed the ceiling by this much
+BAND_FULL_PTS = 20.0         # flat credit anywhere inside the band
+BAND_SHORT_PTS = -60.0       # below the floor; normally filtered before scoring
 
 
-def fullness_score(frac: float) -> float:
-    if frac <= FULLNESS_ANCHORS[0][0]:
-        return FULLNESS_ANCHORS[0][1]
-    for (x0, y0), (x1, y1) in zip(FULLNESS_ANCHORS, FULLNESS_ANCHORS[1:]):
-        if frac <= x1:
-            return round(y0 + (y1 - y0) * (frac - x0) / (x1 - x0), 1)
-    return FULLNESS_ANCHORS[-1][1]
+def fullness_score(block_h: float, ceiling_h: float) -> float:
+    if ceiling_h <= 0:
+        return 0.0
+    if block_h < ceiling_h - BAND_UNDER_H:
+        return BAND_SHORT_PTS
+    return BAND_FULL_PTS
 
 
-# Reporting aids. Ties are far rarer since fullness became continuous, but they
-# still happen at identical distances, so ties resolve toward the better-equipped
-# field, and the reported set is spread across regions instead of clustering in
-# whichever one happens to sit at the ceiling radius.
+# Destination quality. Every field that clears the gate is *legal*; almost none
+# of them are places a business jet actually goes. Nothing in the engine could
+# tell Denison, Iowa from Bangor, Maine — both unflown, both paved, both inside
+# the band — so the whole judgment fell to Dispatch by hand, every board, and
+# re-derived from scratch every session. These three signals are already loaded
+# off OurAirports and cost nothing extra to read.
+#
+# Runway length carries the weight, and `type` is deliberately NOT used. This is
+# the one place the rejected gate's evidence still applies: ARCHIVE.md records
+# that OurAirports labels Morristown, Manassas, Republic and Hanscom
+# `medium_airport` while John C Tune, McKinney National, Denton, Livermore,
+# Hayward, Leesburg Executive and Witham Field are `small_airport` — the same
+# class of field, different label. Scoring that label would re-commit the error
+# that blocked ~980 real bizav airports, just softly instead of absolutely.
+#
+# Length is safe here in a way it was not as a gate. The gate's failure was
+# admitting Petan Ranch (7,500 ft gravel), Melby Ranch (7,400 x 40 turf) and
+# Bell Ranch (8,200 ft dirt) for being long. Those never reach this function:
+# field_quality_ok has already required pavement and 75 ft of width, so scoring
+# runs over an already-gated set where length cannot readmit a ranch strip. It
+# is also the signal that still works for a pure bizav reliever with no airline
+# service — Addison's 7,203 ft separates it from a 5,000 ft county strip, and
+# from this function McKinney and Hanscom are indistinguishable, which is right.
+QUALITY_RWY_ANCHORS = [(5000.0, 0.0), (6500.0, 5.0), (8000.0, 8.0),
+                       (10000.0, 10.0)]
+QUALITY_SCHEDULED = 4.0      # someone runs airline service there: a real facility
+
+
+def quality_score(ap: dict) -> float:
+    rwy = float(ap.get("rwy") or 0)
+    if rwy <= QUALITY_RWY_ANCHORS[0][0]:
+        pts = QUALITY_RWY_ANCHORS[0][1]
+    else:
+        pts = QUALITY_RWY_ANCHORS[-1][1]
+        for (x0, y0), (x1, y1) in zip(QUALITY_RWY_ANCHORS,
+                                      QUALITY_RWY_ANCHORS[1:]):
+            if rwy <= x1:
+                pts = y0 + (y1 - y0) * (rwy - x0) / (x1 - x0)
+                break
+    if ap.get("sched"):
+        pts += QUALITY_SCHEDULED
+    return round(pts, 1)
+
+
+# Reporting aids. Fullness is flat inside the band, so ties at the top are now
+# the normal case and quality is what separates them; TYPE_RANK survives only as
+# a last-resort tie-break below quality, and the reported set is still spread
+# across regions instead of clustering in whichever one sits at the band radius.
 TYPE_RANK = {"large_airport": 3, "medium_airport": 2, "small_airport": 1,
              "seaplane_base": 1}
 MAX_PER_REGION_REPORTED = 3
@@ -660,11 +713,20 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
     positioning = event_dist_nm is not None
     parts["event_positioning"] = EVENT_POSITIONING_BONUS if positioning else 0
 
+    # Destination quality — the discriminator inside a flat fullness band.
+    parts["quality"] = quality_score(ap)
+
     # Fullness.
     fullness = block_h / ceiling_h if ceiling_h > 0 else 0
-    parts["fullness"] = fullness_score(fullness)
+    parts["fullness"] = fullness_score(block_h, ceiling_h)
     if positioning:
-        parts["fullness"] = max(0.0, parts["fullness"])
+        # Under the v6.3 curve, flooring at zero was enough to neutralise the
+        # short-hop penalty. Under the band it is not: an in-band leg scores
+        # BAND_FULL_PTS, so a floored positioning leg would sit a full band's
+        # worth behind and never reach the reported set — the exact failure the
+        # floor exists to prevent. Positioning legs are scored as in-band, which
+        # removes the penalty without awarding anything on top.
+        parts["fullness"] = BAND_FULL_PTS
         parts["region"] = max(0, parts["region"])
 
     return {
@@ -718,8 +780,16 @@ def print_rules() -> None:
         ("verified event (by Dispatch)", EVENT_VERIFIED_BONUS),
     ):
         print(f"  {label:<{w}} {val:+d}")
-    print("  fullness anchors (pct -> pts) "
-          + ", ".join(f"{int(x*100)}%:{y:+.0f}" for x, y in FULLNESS_ANCHORS))
+    print("\nFullness band (absolute, not a fraction of the ceiling)")
+    print(f"  {'full credit from':<{w}} ceiling -{BAND_UNDER_H * 60:.0f} min")
+    print(f"  {'through':<{w}} ceiling +{BAND_OVER_H * 60:.0f} min")
+    print(f"  {'credit inside the band':<{w}} {BAND_FULL_PTS:+.0f}")
+    print(f"  {'below the floor':<{w}} not offered "
+          f"(positioning legs and home base exempt)")
+    print("\nDestination quality (airport `type` is deliberately not scored)")
+    print("  runway anchors (ft -> pts)   "
+          + ", ".join(f"{int(x)}:{y:+.0f}" for x, y in QUALITY_RWY_ANCHORS))
+    print(f"  {'scheduled service':<{w}} {QUALITY_SCHEDULED:+.0f}")
     print(f"\nEvent market radius            {EVENT_RADIUS_NM} nm")
 
 
@@ -916,14 +986,9 @@ def main() -> int:
                 continue
             route = gc * ROUTE_FACTOR
             block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
-            if block > ceiling:
+            if block > ceiling + BAND_OVER_H:
                 continue
 
-            feas = feasibility(lim, block)
-            if feas is None or feas["max_pax"] < 0:
-                continue
-
-            dest_region = region_of(a, doc)
             ev_dist = None
             if args.event_phase == "inbound":
                 for ea in event_pts:
@@ -931,6 +996,23 @@ def main() -> int:
                          else gc_nm(a["lat"], a["lon"], ea["lat"], ea["lon"]))
                     if d <= args.event_radius and (ev_dist is None or d < ev_dist):
                         ev_dist = d
+
+            # Band floor. A leg this far short of the ceiling is not what Kyle
+            # asked for when he stated his availability, so it is not offered at
+            # all rather than offered at a penalty — that is the difference
+            # between a preference and a guarantee. Two exemptions, both legs
+            # that are SUPPOSED to be short: a positioning leg into a verified
+            # event market, and the tail's own home base, which AIRSPACE ROUTING
+            # RULES already holds legal regardless of the other gates.
+            if (block < ceiling - BAND_UNDER_H
+                    and ev_dist is None and ident != tail["home"]):
+                continue
+
+            feas = feasibility(lim, block)
+            if feas is None or feas["max_pax"] < 0:
+                continue
+
+            dest_region = region_of(a, doc)
             sc = score_candidate(a, tail, lim, doc, hist, block, ceiling,
                                  dest_region, home, cur, named, ev_dist)
 
@@ -995,7 +1077,8 @@ def main() -> int:
                 if gc < 1:
                     continue
                 block = gc * ROUTE_FACTOR / tail["ktas"] + overhead_h(gc) + TAXI_H
-                if block > ceiling or feasibility(lim, block) is None:
+                if (block > ceiling + BAND_OVER_H
+                        or feasibility(lim, block) is None):
                     continue
                 d_home = gc_nm(a["lat"], a["lon"], home["lat"], home["lon"])
                 if best is None or d_home < best[0]:
