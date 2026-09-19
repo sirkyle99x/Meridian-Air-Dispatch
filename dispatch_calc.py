@@ -129,16 +129,23 @@ def field_quality_ok(ap: dict) -> bool:
 # Dispatch passes each field (--event KPHX --event KSDL) rather than widening
 # the ring.
 #
-# The bonus is deliberately large. A positioning leg is short and empty by
-# nature, so it earns little or no fullness credit, and it flies toward exactly
-# the region the variety engine is busy penalizing — the event is what
-# concentrated traffic there in the first place. At +20 an Atlanta positioning
-# leg scored 35 against 60 for an unrelated Iowa run. Region and fullness
-# penalties are floored at zero for positioning legs for the same reason: the
-# anti-repetition machinery exists to stop lazy repeats, and this repeat has a
-# stated reason.
+# The bonus is 0 as of v6.2. It was +40, set when a positioning ferry was the
+# only route by which an event reached a board. At that value an in-market leg
+# scored ~100 against a non-event cluster near 60 — an automatic win for the one
+# card type whose payoff lands in a later session that may never happen, bought
+# silently on every board where any event verified. RULES.md now reserves the
+# event slot outright and fills it with a revenue leg by default, so the event
+# card no longer has to win on points, and the positioning leg is gated on ops
+# mode, outbound window and story rather than priced. The constant survives at 0
+# so --rules still names the component and so restoring a value stays one edit.
+#
+# The floors below are NOT part of the bonus and stay. A positioning leg is short
+# and empty by nature, so it earns little or no fullness credit, and it flies
+# toward exactly the region the variety engine is busy penalizing — the event is
+# what concentrated traffic there in the first place. Flooring those two at zero
+# removes a penalty the leg does not deserve; it does not award anything.
 EVENT_RADIUS_NM = 50
-EVENT_POSITIONING_BONUS = 40
+EVENT_POSITIONING_BONUS = 0
 
 # Scoring constants. RULES.md documents what each component MEANS; the values
 # live only here, so there is nothing to keep in sync. --rules prints them.
@@ -647,7 +654,9 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
     # Event repositioning. A positioning leg into an event market is usually a
     # short empty hop, so the fullness penalty would otherwise guarantee it
     # never reaches a board — which is exactly backwards. The penalty is
-    # floored at zero for these; the bonus sits on top.
+    # floored at zero for these. The bonus itself is 0: Dispatch selects the
+    # event card into a reserved slot, so `positioning` and `event_dist_nm`
+    # are the load-bearing output here, not the score.
     positioning = event_dist_nm is not None
     parts["event_positioning"] = EVENT_POSITIONING_BONUS if positioning else 0
 
