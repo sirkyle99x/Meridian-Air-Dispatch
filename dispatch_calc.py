@@ -60,6 +60,18 @@ CEILING_MARGIN_H = 0.5       # block ceiling = availability - 30 min, every leng
 PAX_ALLOWANCE_LB = 230       # 175 body + 55 bag
 BAG_PER_PAX_LB = 55
 
+# Per-model overrides, keyed by MODEL LIMITS' ICAO column, for an airframe
+# whose SimBrief profile has been confirmed to deviate from the global
+# 230/55 standard above. Add an entry only when both numbers are screenshot-
+# confirmed against that profile's Airframe Weights panel — see
+# dispatch_state.md -> MODEL LIMITS for the confirming source and date.
+PAX_ALLOWANCE_LB_OVERRIDE = {
+    "H25B": 195,   # 170 body + 25 bag, confirmed 20 SEP 2026
+}
+BAG_PER_PAX_LB_OVERRIDE = {
+    "H25B": 25,
+}
+
 # Overhead anchors: (gc_nm, hours). Linear interpolation between; flat outside.
 OVERHEAD_ANCHORS = [(50.0, 0.26), (175.0, 0.26), (375.0, 0.26), (600.0, 0.26)]
 
@@ -573,6 +585,9 @@ def day_part(local_hour: int) -> str:
 # ---------------------------------------------------------------------------
 
 def feasibility(lim: dict, block_h: float) -> dict | None:
+    pax_allowance = PAX_ALLOWANCE_LB_OVERRIDE.get(lim["icao"], PAX_ALLOWANCE_LB)
+    bag_per_pax = BAG_PER_PAX_LB_OVERRIDE.get(lim["icao"], BAG_PER_PAX_LB)
+
     fuel_plan = lim["burn"] * block_h + lim["reserve"]
     if fuel_plan > lim["max_fuel"]:
         return None                       # infeasible regardless of range
@@ -586,11 +601,10 @@ def feasibility(lim: dict, block_h: float) -> dict | None:
         return None
 
     max_pax = min(lim["seats"],
-                  int(payload_avail // PAX_ALLOWANCE_LB),
-                  int(lim["baggage"] // BAG_PER_PAX_LB))
-    # Landing weight ceiling, evaluated at the maximum passenger load.
+                  int(payload_avail // pax_allowance),
+                  int(lim["baggage"] // bag_per_pax))
     while max_pax > 0:
-        ldg = lim["bow"] + max_pax * PAX_ALLOWANCE_LB + lim["reserve"]
+        ldg = lim["bow"] + max_pax * pax_allowance + lim["reserve"]
         if ldg <= lim["mlw"]:
             break
         max_pax -= 1
@@ -602,8 +616,8 @@ def feasibility(lim: dict, block_h: float) -> dict | None:
         "max_pax": max_pax,
         "cargo_cap_freight": round(cargo_only),
         "cargo_room_at_max_pax": round(
-            min(payload_avail - max_pax * PAX_ALLOWANCE_LB,
-                lim["baggage"] - max_pax * BAG_PER_PAX_LB)),
+            min(payload_avail - max_pax * pax_allowance,
+                lim["baggage"] - max_pax * bag_per_pax)),
     }
 
 
