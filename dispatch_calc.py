@@ -67,9 +67,11 @@ BAG_PER_PAX_LB = 55
 # dispatch_state.md -> MODEL LIMITS for the confirming source and date.
 PAX_ALLOWANCE_LB_OVERRIDE = {
     "H25B": 195,   # 170 body + 25 bag, confirmed 20 SEP 2026
+    "FA50": 235,   # 200 body + 35 bag, confirmed 23 SEP 2026
 }
 BAG_PER_PAX_LB_OVERRIDE = {
     "H25B": 25,
+    "FA50": 35,
 }
 
 # Overhead anchors: (gc_nm, hours). Linear interpolation between; flat outside.
