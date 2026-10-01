@@ -120,6 +120,14 @@ LARGE_JET_CLASS_D_MIN_RWY = 7000
 # Min rwy alone.
 FIELD_MIN_WIDTH_FT = 75
 
+# Fields renamed after OurAirports last updated, keyed new ident -> old ident.
+# The old record is re-keyed under the new ident so a tail homed at the new
+# ident resolves, and the old ident stops appearing as a separate destination.
+# Delete an entry once OurAirports carries the new ident itself.
+IDENT_ALIASES = {
+    "KDJT": "KPBI",   # Palm Beach Intl, renamed 23 SEP 2026 in dispatch_state.md
+}
+
 PAVED_PREFIXES = ("ASP", "CON", "PEM", "BIT", "TAR", "COM", "PER", "PSP", "MAC")
 
 
@@ -499,6 +507,9 @@ def load_airports(data_dir: str) -> dict:
                 "water": ident in water or row.get("type") == "seaplane_base",
                 "elev": _num(row.get("elevation_ft", ""), float, 0.0),
             }
+    for new, old in IDENT_ALIASES.items():
+        if new not in airports and old in airports:
+            airports[new] = dict(airports.pop(old), ident=new)
     return airports
 
 
