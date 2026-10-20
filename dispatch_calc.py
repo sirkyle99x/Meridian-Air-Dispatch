@@ -35,13 +35,16 @@ Usage
 -----
   python3 dispatch_calc.py --hours 3.5 --table --json-out cands.json
   python3 dispatch_calc.py --hours 4 --tail N24SM --json
-  python3 dispatch_calc.py --finalize picks.json
+  python3 dispatch_calc.py --finalize picks.json --hours 3.5
 
 picks.json is a list of objects:
   {"tail": "N24SM", "dest": "KMEM", "dep_local": "18:05",
    "pax": 4, "cargo": 40, "date": "21OCT26"}
 `dep` defaults to the tail's Current; `date` is the LOCAL departure date at
-the departure airport (DDMMMYY) and defaults to today there.
+the departure airport (DDMMMYY) and defaults to today there. Pass `--hours`
+with --finalize to check each pick against the fullness band; mark a
+positioning leg into a verified event market `"exempt": true` (home-base legs
+are exempt automatically).
 
 Exit codes: 0 ok, 2 no legal candidates, 3 parse/data error,
 4 finalize found a pick that fails a check (details in its `problems`).
@@ -380,6 +383,15 @@ def finalize(args, doc, airports, tf) -> int:
         route = gc * ROUTE_FACTOR
         block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
         pax, cargo = int(p.get("pax", 0)), int(p.get("cargo", 0))
+        if args.hours is not None:
+            ceil_f = args.hours - CEILING_MARGIN_H
+            if block > ceil_f + BAND_OVER_H:
+                problems.append(f"block {fmt_hm(block)} is over the "
+                                f"{fmt_hm(ceil_f)} ceiling")
+            elif (block < ceil_f - BAND_UNDER_H and dest != tail["home"]
+                  and not p.get("exempt")):
+                problems.append(f"block {fmt_hm(block)} is below the fullness "
+                                f"band for a {fmt_hm(ceil_f)} ceiling")
         feas = feasibility(lim, block)
         room = None
         if feas is None:
@@ -1347,7 +1359,14 @@ def main() -> int:
                     reg=tail["tail"], date=date_ddmmmyy, deph=deph, depm=depm),
             })
 
-        if not cands and home is not None:
+        if not cands and tail["current"] == tail["home"]:
+            # Already home: a "ferry toward base" would be a pointless hop to
+            # the nearest field. Nothing strands an aircraft at its own base,
+            # so the tail simply sits this board out.
+            notes.append(
+                f"{tail['tail']}: no mission fits this window from its home "
+                f"base {tail['home']} — left off this board")
+        elif not cands and home is not None:
             # Guaranteed fallback. Range never strands an aircraft — real ferry
             # flights use tech stops — but mission availability can: the amphib
             # parked where there is no water in reach, or a BBJ at a field where
