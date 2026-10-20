@@ -1,38 +1,50 @@
 #!/usr/bin/env python3
 """
-dispatch_calc.py — Meridian Air Dispatch v6.0 candidate math.
+dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v6.8).
 
-Replaces mental great-circle math and live distance iteration with one tool call.
-Reads dispatch_state.md as the single source of truth for state: THE FLEET, MODEL
-LIMITS, REGION TABLE, AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the
-single source of truth for every scoring CONSTANT — RULES.md references them
-rather than restating them, so they exist in exactly one place. `--rules`
-prints the active table. Reads airport geometry
-from the OurAirports CSVs.
-
-v5.0 split the inputs. State (which changes every flight) lives in
-dispatch_state.md; rules (which change rarely) live in DISPATCH.md, which this
-script no longer reads. The script parsed about 9% of DISPATCH.md and ignored the
-rest, so pointing it at a small state file costs nothing and makes the file cheap
-to put on disk at session start. This file is hosted at
+Reads dispatch_state.md for state: THE FLEET, MODEL LIMITS, REGION TABLE,
+AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the single source of truth
+for every scoring CONSTANT — RULES.md references them rather than restating
+them. `--rules` prints the active table. Airport geometry comes from the
+OurAirports CSVs. Hosted at
 https://raw.githubusercontent.com/sirkyle99x/Meridian-Air-Dispatch/main/dispatch_calc.py
 and fetched rather than retyped.
 
-Computes, per candidate destination: great-circle nm, route nm, block, session,
-fullness, every mechanical score component from DISPATCH.md's VARIETY ENGINE, the
-Section 6a feasibility checks, the departure day-part, and a SimBrief URL.
+Three modes:
 
-Left to Dispatch: the event bonus, the story, job type, pax and cargo within the
-computed envelope, and board composition.
+  Candidates  Per destination: great-circle and route nm, block, session,
+              fullness, every mechanical score component from RULES.md →
+              VARIETY ENGINE, the LOAD PLANNING feasibility checks, and a
+              SimBrief URL skeleton. `--json` for the full record, `--table`
+              for the step-6 decision table with each departure airport's
+              sun times, `--json-out FILE` to save the JSON while printing
+              the table, so one run serves both.
+
+  Finalize    `--finalize picks.json` takes the story picks — tail, dest,
+              local departure time, pax, cargo — and returns everything a
+              card needs: Zulu and local departure, Zulu date, the five-way
+              day-part from real sun times, the RULE 1 icon, block, session,
+              a payload check, and the finished SimBrief URL. No --hours.
+
+  Rules       `--rules` prints the constants.
+
+Left to Dispatch: the event bonus, the story, job type, the chosen pax, cargo
+and departure time, and board composition.
 
 Usage
 -----
-  python3 dispatch_calc.py --hours 3.5
-  python3 dispatch_calc.py --hours 4 --tail N100PE
-  python3 dispatch_calc.py --hours 6 --model "Citation X" --depz 1330
-  python3 dispatch_calc.py --hours 2 --class turboprop --json
+  python3 dispatch_calc.py --hours 3.5 --table --json-out cands.json
+  python3 dispatch_calc.py --hours 4 --tail N24SM --json
+  python3 dispatch_calc.py --finalize picks.json
 
-Exit codes: 0 ok, 2 no legal candidates, 3 parse/data error.
+picks.json is a list of objects:
+  {"tail": "N24SM", "dest": "KMEM", "dep_local": "18:05",
+   "pax": 4, "cargo": 40, "date": "21OCT26"}
+`dep` defaults to the tail's Current; `date` is the LOCAL departure date at
+the departure airport (DDMMMYY) and defaults to today there.
+
+Exit codes: 0 ok, 2 no legal candidates, 3 parse/data error,
+4 finalize found a pick that fails a check (details in its `problems`).
 """
 
 from __future__ import annotations
@@ -48,9 +60,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
-# Constants that mirror DISPATCH.md body text (rules, not state). Any change here
-# must be made in that document in the same edit — see CORE PHILOSOPHY, body text
-# governs. State lives in dispatch_state.md and is never hardcoded here.
+# Scoring and timing constants. This file is their only home; RULES.md says
+# where to find them rather than restating them. State lives in
+# dispatch_state.md and is never hardcoded here.
 # ---------------------------------------------------------------------------
 
 ROUTE_FACTOR = 1.07          # FLIGHT TIME CALCULATION
@@ -274,6 +286,239 @@ DAY_PARTS = [
     ("evening", 17, 20),
     ("night", 20, 5),
 ]
+# DAY_PARTS above only labels the --depz placeholder. Story departures use the
+# five day-parts in RULES.md → VARIETY ENGINE → Departure time, computed below
+# from the real sun at the departure airport.
+
+SUN_WINDOW_MIN = 45            # sunrise/sunset window, either side of the event
+DAY_PART_ICON = {
+    "sunrise": "ti-sunrise",
+    "morning": "ti-sun",
+    "afternoon": "ti-sun",
+    "sunset": "ti-sunset",
+    "night": "ti-moon-stars",
+}
+
+
+def sun_times(lat: float, lon: float, tzname: str, local_date):
+    """(sunrise, sunset) as aware local datetimes, or None (no astral, polar)."""
+    try:
+        from astral import Observer
+        from astral.sun import sunrise, sunset
+    except ImportError:
+        return None
+    obs = Observer(latitude=lat, longitude=lon)
+    tz = ZoneInfo(tzname)
+    try:
+        return (sunrise(obs, date=local_date, tzinfo=tz),
+                sunset(obs, date=local_date, tzinfo=tz))
+    except ValueError:            # sun never rises or never sets that day
+        return None
+
+
+def story_day_part(dep_local: datetime, sun) -> str:
+    """Five-way day-part for a story-chosen local departure."""
+    if sun is None:               # no sun data: clock-only fallback, no windows
+        h = dep_local.hour
+        return "morning" if 5 <= h < 12 else "afternoon" if 12 <= h < 18 else "night"
+    sr, ss = sun
+    w = timedelta(minutes=SUN_WINDOW_MIN)
+    if abs(dep_local - sr) <= w:
+        return "sunrise"
+    if abs(dep_local - ss) <= w:
+        return "sunset"
+    noon = dep_local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if sr + w < dep_local < noon:
+        return "morning"
+    if noon <= dep_local < ss - w:
+        return "afternoon"
+    return "night"
+
+
+def cargo_klbs(lbs: int) -> str:
+    """SimBrief's cargo parameter is thousands of lbs: 200 -> 0.2."""
+    if lbs <= 0:
+        return "0"
+    return f"{lbs / 1000:.3f}".rstrip("0").rstrip(".")
+
+
+def finalize(args, doc, airports, tf) -> int:
+    try:
+        with open(args.finalize, encoding="utf-8") as fh:
+            picks = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"error reading {args.finalize}: {exc}", file=sys.stderr)
+        return 3
+    if isinstance(picks, dict):
+        picks = picks.get("picks", [picks])
+    if tf is None:
+        print("timezonefinder is required for --finalize", file=sys.stderr)
+        return 3
+
+    fleet = {f["tail"].upper(): f for f in doc.fleet}
+    out, notes, failed = [], [], False
+    for n, p in enumerate(picks, 1):
+        problems = []
+        tail = fleet.get(str(p.get("tail", "")).upper())
+        if tail is None:
+            out.append({"pick": n, "problems": [f"unknown tail {p.get('tail')}"]})
+            failed = True
+            continue
+        dep = str(p.get("dep") or tail["current"]).upper()
+        dest = str(p.get("dest", "")).upper()
+        cur, a = airports.get(dep), airports.get(dest)
+        if cur is None or a is None:
+            out.append({"pick": n, "tail": tail["tail"], "problems":
+                        [f"{dep if cur is None else dest} not in the airport database"]})
+            failed = True
+            continue
+        lim = doc.limits_for(tail["model"])
+        pax_allow = PAX_ALLOWANCE_LB_OVERRIDE.get(lim["icao"], PAX_ALLOWANCE_LB)
+        bag_pp = BAG_PER_PAX_LB_OVERRIDE.get(lim["icao"], BAG_PER_PAX_LB)
+
+        gc = gc_nm(cur["lat"], cur["lon"], a["lat"], a["lon"])
+        route = gc * ROUTE_FACTOR
+        block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
+        pax, cargo = int(p.get("pax", 0)), int(p.get("cargo", 0))
+        feas = feasibility(lim, block)
+        room = None
+        if feas is None:
+            problems.append("fuel or payload infeasible at this block time")
+        else:
+            if pax > feas["max_pax"]:
+                problems.append(f"{pax} pax exceeds max {feas['max_pax']}")
+            room = round(min(feas["payload_avail"] - pax * pax_allow,
+                             lim["baggage"] - pax * bag_pp))
+            if cargo > room:
+                problems.append(f"{cargo} lbs cargo exceeds the {room} lbs "
+                                f"room at {pax} pax")
+
+        tzname = tf.timezone_at(lat=cur["lat"], lng=cur["lon"])
+        if not tzname:
+            out.append({"pick": n, "tail": tail["tail"],
+                        "problems": [f"no time zone for {dep}"]})
+            failed = True
+            continue
+        tz = ZoneInfo(tzname)
+        if p.get("date"):
+            ld = datetime.strptime(str(p["date"]), "%d%b%y").date()
+        else:
+            ld = datetime.now(tz).date()
+        hhmm = str(p.get("dep_local", "")).replace(":", "").strip()
+        if len(hhmm) != 4 or not hhmm.isdigit():
+            out.append({"pick": n, "tail": tail["tail"],
+                        "problems": ["dep_local must be HH:MM"]})
+            failed = True
+            continue
+        mins = int(hhmm[:2]) * 60 + int(hhmm[2:])
+        rounded = int(round(mins / 5.0)) * 5 % (24 * 60)
+        if rounded != mins:
+            notes.append(f"pick {n}: {hhmm[:2]}:{hhmm[2:]} rounded to the "
+                         f"nearest 5 minutes")
+        dep_l = datetime(ld.year, ld.month, ld.day, rounded // 60, rounded % 60,
+                         tzinfo=tz)
+        dep_z = dep_l.astimezone(timezone.utc)
+        sun = sun_times(cur["lat"], cur["lon"], tzname, ld)
+        part = story_day_part(dep_l, sun)
+        zdate = dep_z.strftime("%d%b%y").upper()
+        url = (SIMBRIEF_URL.format(type=tail["icao"], orig=dep, dest=dest,
+                                   reg=tail["tail"], date=zdate,
+                                   deph=f"{dep_z.hour:02d}",
+                                   depm=f"{dep_z.minute:02d}")
+               .replace("{PAX}", str(pax))
+               .replace("{CARGO_KLBS}", cargo_klbs(cargo)))
+        if doc.class_register.get(dest) == "B" and dest != tail["home"]:
+            notes.append(f"pick {n}: {dest} is Class B in the register — "
+                         f"only if the story demands it (AIRSPACE ROUTING RULES)")
+        failed = failed or bool(problems)
+        out.append({
+            "pick": n, "tail": tail["tail"], "model": tail["model"],
+            "icao_type": tail["icao"], "dep": dep, "dep_city": cur["muni"],
+            "dest": dest, "dest_city": a["muni"], "dest_name": a["name"],
+            "gc_nm": round(gc), "route_nm": round(route),
+            "block": fmt_hm(block), "session": fmt_hm(block + PREP_H),
+            "pax": pax, "cargo": cargo, "cargo_room_at_pax": room,
+            "departure": f"{dep_z:%H%M}Z / {dep_l:%H:%M} LCL",
+            "dep_zulu": f"{dep_z:%H%M}Z", "dep_local": f"{dep_l:%H:%M}",
+            "local_date": ld.strftime("%d%b%y").upper(), "zulu_date": zdate,
+            "tz": tzname,
+            "sunrise": f"{sun[0]:%H:%M}" if sun else None,
+            "sunset": f"{sun[1]:%H:%M}" if sun else None,
+            "day_part": part, "sun_edge": part in ("sunrise", "sunset"),
+            "icon": DAY_PART_ICON[part],
+            "simbrief": url, "problems": problems,
+        })
+
+    good = [r for r in out if "day_part" in r]
+    if good:
+        counts: dict[str, int] = {}
+        for r in good:
+            counts[r["day_part"]] = counts.get(r["day_part"], 0) + 1
+        for part, c in counts.items():
+            if c > 2:
+                notes.append(f"{c} cards in the {part} day-part; the cap is 2")
+        if len(good) > 1 and not any(r["sun_edge"] for r in good):
+            notes.append("no sun-edge card on this board")
+    print(json.dumps({"notes": notes, "picks": out}, indent=2))
+    return 4 if failed else 0
+
+
+def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date):
+    """Step-6 decision table: one block per tail, plus departure sun times."""
+    print(f"Block ceiling {fmt_hm(ceiling)} · date {date_ddmmmyy} · "
+          f"{len(results)} candidates")
+    for n in notes:
+        print(f"note: {n}")
+    by_tail: dict[str, list] = {}
+    for c in results:
+        by_tail.setdefault(c["tail"], []).append(c)
+    sun_cache: dict[str, str] = {}
+    for tail_id, cands in by_tail.items():
+        t = cands[0]
+        dep = t["dep"]
+        if dep not in sun_cache:
+            line = "sun n/a"
+            ap = airports.get(dep)
+            tzname = tf.timezone_at(lat=ap["lat"], lng=ap["lon"]) if (tf and ap) else None
+            if tzname:
+                ld = flight_date.astimezone(ZoneInfo(tzname)).date()
+                sun = sun_times(ap["lat"], ap["lon"], tzname, ld)
+                if sun:
+                    w = timedelta(minutes=SUN_WINDOW_MIN)
+                    sr, ss = sun
+                    line = (f"sunrise {sr:%H:%M} ({sr - w:%H:%M}–{sr + w:%H:%M}) · "
+                            f"sunset {ss:%H:%M} ({ss - w:%H:%M}–{ss + w:%H:%M}) "
+                            f"{sr:%Z}")
+            sun_cache[dep] = line
+        print(f"\n{tail_id} {t['icao_type']} · {t['ops']} · at {dep} {t['dep_city']}"
+              + (" · home pull" if t["home_pull_active"] else "")
+              + f" · {sun_cache[dep]}")
+        print(f"  {'DEST':<5} {'CITY':<18} {'REGION':<20} {'CL':<3} {'RWY':>6} "
+              f"{'TYPE':<6} {'Q':>4} {'FULL':>5} {'BLOCK':>7} {'SESS':>7} "
+              f"{'PAX':>3} {'CGO':>5} {'SCORE':>6} FLAGS")
+        for c in cands:
+            flags = []
+            if c.get("fallback"):
+                flags.append("FALLBACK")
+            if c["positioning"]:
+                flags.append("POS")
+            if c["event_dist_nm"] is not None:
+                flags.append(f"EV{c['event_dist_nm']}")
+            if c["event_tie_available"]:
+                flags.append("EV-OUT")
+            if c["toward_home"]:
+                flags.append("home-ward")
+            q = c["score_parts"].get("quality", 0)
+            cl = c["dest_class"] + ("" if c["class_verified"] else "?")
+            print(f"  {c['dest']:<5} {c['dest_city'][:18]:<18} "
+                  f"{c['dest_region'][:20]:<20} {cl:<3} {c['dest_rwy_ft']:>6} "
+                  f"{c['dest_type'].replace('_airport', '')[:6]:<6} {q:>4g} "
+                  f"{str(c['fullness_pct']) + '%':>5} {c['block']:>7} "
+                  f"{c['session']:>7} {c['max_pax']:>3} "
+                  f"{c['cargo_room_at_max_pax']:>5} {c['score']:>6g} "
+                  + " ".join(flags))
+    print("\nCL '?' = proxy class, unverified. CGO = freight room at max pax. "
+          "Departure times here are placeholders; use --finalize for card times.")
 
 
 # ---------------------------------------------------------------------------
@@ -826,11 +1071,12 @@ def main() -> int:
         return 0
 
     ap_arg = argparse.ArgumentParser(
-        description="Meridian Air Dispatch v6.0 candidate math")
+        description="Meridian Air Dispatch candidate math (RULES.md v6.8)")
     ap_arg.add_argument("--rules", action="store_true",
                         help="print the active scoring constants and exit")
-    ap_arg.add_argument("--hours", type=float, required=True,
-                        help="stated availability in hours")
+    ap_arg.add_argument("--hours", type=float,
+                        help="stated availability in hours (required except "
+                             "with --finalize)")
     ap_arg.add_argument("--include-stored", action="store_true",
                         help="include tails marked stored in THE FLEET")
     ap_arg.add_argument("--tail", help="restrict to one tail, e.g. N100PE")
@@ -879,7 +1125,17 @@ def main() -> int:
                              "the event tie — no geographic bonus applies, "
                              "because every departure is equally event-tied")
     ap_arg.add_argument("--json", action="store_true")
+    ap_arg.add_argument("--table", action="store_true",
+                        help="print the step-6 decision table with each "
+                             "departure airport's sun times")
+    ap_arg.add_argument("--json-out", metavar="FILE",
+                        help="also write the --json payload to FILE")
+    ap_arg.add_argument("--finalize", metavar="PICKS",
+                        help="compute card fields and finished SimBrief URLs "
+                             "for the story picks in PICKS (a JSON file)")
     args = ap_arg.parse_args()
+    if args.hours is None and not args.finalize:
+        ap_arg.error("--hours is required unless --finalize is given")
 
     try:
         doc = Doc(args.doc)
@@ -891,6 +1147,14 @@ def main() -> int:
     except OSError as exc:
         print(f"error reading airport data: {exc}", file=sys.stderr)
         return 3
+
+    if args.finalize:
+        try:
+            from timezonefinder import TimezoneFinder
+            tf_f = TimezoneFinder()
+        except ImportError:
+            tf_f = None
+        return finalize(args, doc, airports, tf_f)
 
     ceiling = args.hours - CEILING_MARGIN_H
     if ceiling <= 0:
@@ -1180,9 +1444,17 @@ def main() -> int:
             print(f"  note: {n}", file=sys.stderr)
         return 2
 
+    payload = {"ceiling_h": ceiling, "date": date_ddmmmyy,
+               "notes": notes, "candidates": results}
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+    if args.table:
+        print_table(results, notes, ceiling, date_ddmmmyy, airports, tf,
+                    dep_dt_utc)
+        return 0
     if args.json:
-        print(json.dumps({"ceiling_h": ceiling, "date": date_ddmmmyy,
-                          "notes": notes, "candidates": results}, indent=2))
+        print(json.dumps(payload, indent=2))
         return 0
 
     print(f"Block ceiling {fmt_hm(ceiling)} "
