@@ -19,6 +19,7 @@ ARCHIVE.md → CHANGE CONTROL. Exits non-zero on any failure.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,6 +30,9 @@ SCRIPT = os.path.join(ROOT, "dispatch_calc.py")
 STATE = os.path.join(ROOT, "tests", "fixtures", "dispatch_state.md")
 DATA = os.environ.get("DISPATCH_TEST_DATA", os.path.join(ROOT, "tests", "data"))
 UPDATE_SNAPSHOT = "--update-snapshot" in sys.argv
+_src = open(SCRIPT, encoding="utf-8").read()
+SCRIPT_VERSION = re.search(r'SCRIPT_VERSION = "([\d.]+)"', _src).group(1)
+STATE_SCHEMA = re.search(r'STATE_SCHEMA = "([\d.]+)"', _src).group(1)
 if not os.path.exists(os.path.join(DATA, "airports.csv")):
     sys.exit(f"no airport data in {DATA} — run: bash tests/fetch_data.sh")
 TMP = tempfile.mkdtemp(prefix="dispatch_g_")
@@ -74,8 +78,8 @@ if UPDATE_SNAPSHOT:
     with open(snap, "w") as fh:
         fh.write(out)
     print(f"snapshot rewritten: {snap}")
-check("G1", "--rules matches stored snapshot, v7.0, no retired components",
-      rc == 0 and out == open(snap).read() and "v7.0" in out
+check("G1", "--rules matches stored snapshot, current version, no retired components",
+      rc == 0 and out == open(snap).read() and f"v{SCRIPT_VERSION}" in out
       and "model rotation" not in out and "verified event" not in out
       and "Sun window" in out and "override H25B" in out)
 
@@ -264,16 +268,74 @@ check("G17", "N312FU→KAUS in-market at 0 nm, block 1h 53m, no `positioning` ke
 rc, _, err = run("--expect", "6.9", "--rules")
 rc_rules = rc
 rc, _, err = run("--expect", "6.9", "--tail", "N13SY", "--hours", "2.5")
-st = state_variant("schema.md", "Schema v6.2", "Schema v6.1")
+st = state_variant("schema.md", f"Schema v{STATE_SCHEMA}", "Schema v0.9")
 rc2, _, err2 = run("--tail", "N13SY", "--hours", "2.5", doc=st)
 check("B1", "--expect mismatch exit 5; old schema exit 3",
-      rc == 5 and rc2 == 3 and "schema 6.1" in err2, f"{rc} {err} | {rc2} {err2}")
+      rc == 5 and rc2 == 3 and "schema 0.9" in err2, f"{rc} {err} | {rc2} {err2}")
 
 # A1 regression: an unparseable Route is a hard error
 st = state_variant("route.md", "| KLGB-KSAF |", "| KLGB to KSAF |")
 rc, _, err = run("--tail", "N13SY", "--hours", "2.5", doc=st)
 check("A1", "unparseable logbook Route → exit 3 naming it",
       rc == 3 and "KLGB to KSAF" in err, err.strip()[:160])
+
+# ---- v7.1 (Phase 3) -------------------------------------------------------
+
+# G19 no military-only field in any class run at 1.5 / 2.5 / 4 h
+mil = []
+for hours in ("1.5", "2.5", "4"):
+    for cls in ("turboprop", "mid_jet", "large_jet"):
+        rc, out, _ = run("--class", cls, "--hours", hours, "--date", "12NOV26",
+                         "--json")
+        if rc != 0:
+            continue
+        for c in json.loads(out)["candidates"]:
+            a = aps[c["dest"]]
+            if dc.military_only(a) and c["dest"] not in doc.preferred:
+                mil.append(f"{c['tail']}→{c['dest']} {hours}h")
+gate_kept = all(not dc.military_only(aps[i])
+                for i in ("KNYL", "KBLV", "KSPS", "KGRK", "KDOV", "KCEF", "KFHU"))
+gate_out = all(dc.military_only(aps[i]) for i in ("KBAD", "KLRF", "KBIF", "KNFL"))
+check("G19", "no military-only field on any board; joint-use civil fields kept",
+      not mil and gate_kept and gate_out, "; ".join(mil[:5]))
+
+# G20 Falcon 50 Max GC
+rc, out, _ = run("--tail", "N388BB", "--hours", "4.5", "--date", "12NOV26", "--json")
+cands = json.loads(out)["candidates"] if rc == 0 else []
+far = [c["dest"] for c in cands if c["gc_nm"] > 1550]
+rc6, _, err6 = run("--tail", "N388BB", "--hours", "6", "--date", "12NOV26", "--json")
+rc2, j, _ = finalize([{"tail": "N388BB", "dest": "KSEA", "dep_local": "10:00",
+                       "pax": 2, "cargo": 0, "date": "12NOV26"}], "--hours", "6.5",
+                     "--allow-b")
+probs = j["picks"][0]["problems"] if j else []
+check("G20", "Falcon: 4.5 h board within 1,550 nm; 6 h sits out; KTEB→KSEA flagged",
+      bool(cands) and not far and rc6 == 2 and "left off this board" in err6
+      and any("Max GC of 1550" in p for p in probs),
+      f"{len(cands)} cands, over {far} · 6h exit {rc6} · {probs}")
+
+# G21 preferred fields score the cap, incl. a short reliever and a scenery field
+tail_mj = next(f for f in doc.fleet if f["tail"] == "N13SY")
+tail_tp = next(f for f in doc.fleet if f["tail"] == "N417KG")
+qp = dc.quality_score(aps["KPWK"], "mid_jet", "KPWK" in doc.preferred)
+qr = dc.quality_score(aps["KRVS"], "mid_jet", "KRVS" in doc.preferred)
+qn = dc.quality_score(aps["KPWK"], "mid_jet", False)
+check("G21", "KPWK and KRVS preferred → 14; KPWK unpreferred → 2.0",
+      qp == 14 and qr == 14 and qn == 2.0 and len(doc.preferred) == 43,
+      f"KPWK {qp} KRVS {qr} plain {qn} n={len(doc.preferred)}")
+
+# G22 per-class runway curves
+q = dc.quality_score
+check("G22", "7,000 ft no-service field: mid jet 10, large jet 6.0; 5,000 ft: turboprop 10",
+      q({"rwy": 7000, "sched": False}, "mid_jet") == 10
+      and q({"rwy": 7000, "sched": False}, "large_jet") == 6.0
+      and q({"rwy": 5000, "sched": False}, "turboprop") == 10
+      and q({"rwy": 12000, "sched": True}, "mid_jet") == 14,
+      "")
+
+# G23 unregistered US hub proxies as C, never B
+check("G23", "unregistered US large_airport (KAUS, KELP) proxies C; register B stays B",
+      dc.proxy_class(aps["KAUS"]) == "C" and dc.proxy_class(aps["KELP"]) == "C"
+      and doc.class_register.get("KATL") == "B")
 
 failed = [g for g, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed"

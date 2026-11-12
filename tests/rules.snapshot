@@ -1,4 +1,4 @@
-Meridian Air Dispatch — active scoring constants · script v7.0 · state schema 6.2
+Meridian Air Dispatch — active scoring constants · script v7.1 · state schema 6.3
 
 Timing
   route factor                   x1.07
@@ -38,8 +38,12 @@ Fullness band (absolute, not a fraction of the ceiling)
   below the floor                not offered (in-market legs and home base exempt, scored in-band)
 
 Destination quality (airport `type` is deliberately not scored)
-  runway anchors (ft -> pts)   5000:+0, 6500:+5, 8000:+8, 10000:+10
+  runway turboprop (ft:pts)      2500:+0, 4000:+6, 5000:+10
+  runway mid_jet (ft:pts)        4500:+0, 6000:+6, 7000:+10
+  runway large_jet (ft:pts)      5000:+0, 6500:+5, 8000:+8, 10000:+10
   scheduled service              +4
+  PREFERRED FIELDS               14 (the cap)
+  military, no service           not offered unless preferred
 
 Event market radius            50 nm (flag only, no score)
 Sun window                     ±45 min of sunrise/sunset

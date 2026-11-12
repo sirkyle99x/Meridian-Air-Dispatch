@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.0).
+dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.1).
 
 Reads dispatch_state.md for state: THE FLEET, MODEL LIMITS, REGION TABLE,
 AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the single source of truth
@@ -40,8 +40,8 @@ time, event verification, and board composition.
 
 Usage
 -----
-  python3 dispatch_calc.py --expect 7.0 --hours 2.5 --tail N24SM --table --json-out cands.json
-  python3 dispatch_calc.py --expect 7.0 --finalize picks.json --hours 2.5
+  python3 dispatch_calc.py --expect 7.1 --hours 2.5 --tail N24SM --table --json-out cands.json
+  python3 dispatch_calc.py --expect 7.1 --finalize picks.json --hours 2.5
 
 picks.json is a list of objects:
   {"tail": "N24SM", "dest": "KAEX", "dep_local": "18:05",
@@ -70,8 +70,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-SCRIPT_VERSION = "7.0"       # must equal the RULES.md version; see --expect
-STATE_SCHEMA = "6.2"         # must equal dispatch_state.md's "Schema v" header
+SCRIPT_VERSION = "7.1"       # must equal the RULES.md version; see --expect
+STATE_SCHEMA = "6.3"         # must equal dispatch_state.md's "Schema v" header
 HOME_TZ = "America/New_York" # Kyle's zone: the default --date is his local date
 
 
@@ -273,25 +273,62 @@ def fullness_score(block_h: float, ceiling_h: float) -> float:
 # is also the signal that still works for a pure bizav reliever with no airline
 # service — Addison's 7,203 ft separates it from a 5,000 ft county strip, and
 # from this function McKinney and Hanscom are indistinguishable, which is right.
-QUALITY_RWY_ANCHORS = [(5000.0, 0.0), (6500.0, 5.0), (8000.0, 8.0),
-                       (10000.0, 10.0)]
+#
+# v7.1: the runway curve is per class and plateaus where more runway stops
+# meaning a better field for that aircraft. Under one fleet-wide curve that
+# topped out at 10,000 ft, a 7,000 ft bizav field scored like a compromise for
+# a mid jet that needs 5,000 — Chicago Executive 0.0, Morristown 3.3 — while
+# any airline airport with a long runway hit the cap. Every curve tops out at
+# the same 10 points, so the classes stay comparable.
+QUALITY_RWY_ANCHORS = {
+    "turboprop": [(2500.0, 0.0), (4000.0, 6.0), (5000.0, 10.0)],
+    "mid_jet":   [(4500.0, 0.0), (6000.0, 6.0), (7000.0, 10.0)],
+    "large_jet": [(5000.0, 0.0), (6500.0, 5.0), (8000.0, 8.0), (10000.0, 10.0)],
+}
 QUALITY_SCHEDULED = 4.0      # someone runs airline service there: a real facility
+# A field on dispatch_state.md → PREFERRED FIELDS scores the cap outright. That
+# list is Kyle's: the bizav relievers AIRSPACE ROUTING RULES names, the resort
+# fields he flies, and the scenery fields he owns. It ranks among legal fields
+# only — it never readmits one the gate rejected.
+QUALITY_MAX = 14.0
 
 
-def quality_score(ap: dict) -> float:
+def quality_score(ap: dict, cls: str, preferred: bool = False) -> float:
+    if preferred:
+        return QUALITY_MAX
+    anchors = QUALITY_RWY_ANCHORS[cls]
     rwy = float(ap.get("rwy") or 0)
-    if rwy <= QUALITY_RWY_ANCHORS[0][0]:
-        pts = QUALITY_RWY_ANCHORS[0][1]
+    if rwy <= anchors[0][0]:
+        pts = anchors[0][1]
     else:
-        pts = QUALITY_RWY_ANCHORS[-1][1]
-        for (x0, y0), (x1, y1) in zip(QUALITY_RWY_ANCHORS,
-                                      QUALITY_RWY_ANCHORS[1:]):
+        pts = anchors[-1][1]
+        for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
             if rwy <= x1:
                 pts = y0 + (y1 - y0) * (rwy - x0) / (x1 - x0)
                 break
     if ap.get("sched"):
         pts += QUALITY_SCHEDULED
-    return round(pts, 1)
+    return round(min(pts, QUALITY_MAX), 1)
+
+
+# Military fields. A field named as a base, with no airline service and no civil
+# designator in its name, is not a charter destination — Barksdale, Fort Bliss,
+# NAS Fallon all reached boards on runway length alone. The test reads facts,
+# not a hand-kept list: joint-use civil airports (Yuma International / MCAS
+# Yuma, Scott AFB / MidAmerica, Westover Metropolitan) carry airline service or
+# a civil name and stay legal. A field on PREFERRED FIELDS is always allowed.
+MILITARY_NAME_RE = re.compile(
+    r"\b(AFB|Air Force Base|Air Reserve Base|ARB|Air Reserve Station|"
+    r"Naval Air Station|Naval Air Facility|NAS|NAF|JRB|Naval|Navy|"
+    r"Army Air ?field|AAF|Army Heliport|Marine Corps|MCAS|MCAF|Joint Base|"
+    r"Air National Guard|ANGB|Military|Air Base|Space Force)\b", re.I)
+CIVIL_NAME_RE = re.compile(
+    r"\b(Municipal|Regional|International|Metropolitan|Civil)\b", re.I)
+
+
+def military_only(ap: dict) -> bool:
+    return bool(MILITARY_NAME_RE.search(ap["name"]) and not ap.get("sched")
+                and not CIVIL_NAME_RE.search(ap["name"]))
 
 
 # Reporting aids. Fullness is flat inside the band, so ties at the top are now
@@ -389,6 +426,9 @@ def destination_gate(a: dict, tail: dict, doc, *, allow_small: bool,
     if not allow_small and not is_home and not field_quality_ok(a):
         problems.append(f"{ident} fails the field quality gate (paved, "
                         f"{FIELD_MIN_WIDTH_FT} ft wide)")
+    if not is_home and ident not in doc.preferred and military_only(a):
+        problems.append(f"{ident} is a military field with no airline service "
+                        f"({a['name']})")
     class_b = False
     if not is_home:
         if eff == "B":
@@ -487,6 +527,9 @@ def finalize(args, doc, airports, tf, manifest: str) -> int:
                          f"authorized category; tourist travel is prohibited")
 
         gc = gc_nm(cur["lat"], cur["lon"], a["lat"], a["lon"])
+        if lim["max_gc"] and gc > lim["max_gc"]:
+            problems.append(f"{round(gc)} nm great-circle exceeds the "
+                            f"{tail['model']} Max GC of {lim['max_gc']:.0f} nm")
         route = gc * ROUTE_FACTOR
         block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
         pax = _int_field(p, "pax", problems)
@@ -648,6 +691,8 @@ def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date
                 flags.append("home-ward")
             if c["dest"] == c["home"]:
                 flags.append("HOME")
+            if c.get("preferred"):
+                flags.append("PREF")
             q = c["score_parts"].get("quality", 0)
             cl = c["dest_class"] + ("" if c["class_verified"] else "?")
             print(f"  {c['dest']:<5} {c['dest_city'][:18]:<18} "
@@ -799,7 +844,7 @@ class Doc:
         num_cols = ("Seats", "BOW", "MZFW", "MTOW", "MLW", "Max fuel", "Baggage",
                     "Plan burn", "Reserve")
         for r in parse_table(text, "MODEL LIMITS", "Model",
-                             required=("Model", "ICAO") + num_cols):
+                             required=("Model", "ICAO", "Max GC") + num_cols):
             if not r.get("Model"):
                 continue
             mdl = r["Model"].strip()
@@ -810,6 +855,9 @@ class Doc:
                 "mzfw": v["MZFW"], "mtow": v["MTOW"], "mlw": v["MLW"],
                 "max_fuel": v["Max fuel"], "baggage": v["Baggage"],
                 "burn": v["Plan burn"], "reserve": v["Reserve"],
+                "max_gc": (None if not r["Max GC"].strip() or r["Max GC"].strip()
+                           in ("—", "-") else _req_num("MODEL LIMITS", mdl,
+                                                        "Max GC", r["Max GC"])),
             }
         for f in self.fleet:
             if f["model"] not in self.limits:
@@ -864,6 +912,17 @@ class Doc:
                 self.class_register[r["ICAO"].strip().upper()] = \
                     r["Class"].strip().upper()
 
+        # Kyle's preferred destinations: score the quality cap, and override
+        # the military exclusion. Unknown idents are checked in preflight.
+        self.preferred = {}
+        for r in parse_table(text, "PREFERRED FIELDS", "ICAO",
+                             required=("ICAO", "Note")):
+            icao = r.get("ICAO", "").strip().upper()
+            if icao:
+                if icao in self.preferred:
+                    raise DataError(f"PREFERRED FIELDS: {icao} listed twice")
+                self.preferred[icao] = r.get("Note", "").strip()
+
         # A Route that does not parse is a hard error. It used to be skipped
         # silently: rows written `KPWK-KDAB` never matched an arrow-only
         # pattern, so recency and region rotation read an empty logbook from
@@ -896,7 +955,8 @@ class Doc:
         active = sum(1 for f in self.fleet if f["status"] == "active")
         s = (f"state: {len(self.fleet)} tails ({active} active) · "
              f"{len(self.limits)} models · {len(self.class_register)} register · "
-             f"{len(self.logbook)}/{self.logbook_rows} logbook rows")
+             f"{len(self.logbook)}/{self.logbook_rows} logbook rows · "
+             f"{len(self.preferred)} preferred")
         if airports is not None:
             s += f" · {len(airports):,} airports"
         return s
@@ -1015,15 +1075,18 @@ def load_airports(data_dir: str, floor: int = DATA_FLOOR_DEFAULT) -> dict:
 def proxy_class(ap: dict) -> str:
     """Coarse airspace-tier proxy from the OurAirports `type` field.
 
-    Returns a string of candidate classes. 'BC' means the register has not
-    verified it yet and it could be either — Dispatch verifies before it makes
-    a final board, per AIRPORT CLASS REGISTER.
+    Returns a string of candidate classes. A verified class always comes from
+    AIRPORT CLASS REGISTER instead; this is only the fallback for the fields
+    the register does not list, none of which is Class B.
     """
     t = ap["type"]
     if t == "seaplane_base":
         return "W"
     if ap["country"] == "US":
-        return {"large_airport": "BC", "medium_airport": "CD",
+        # v7.1: the register holds every US Class B airport (37 primaries,
+        # checked against the FAA list 12 NOV 2026, plus Nellis and Love Field
+        # inside a primary's surface area), so an unregistered US hub is not B.
+        return {"large_airport": "C", "medium_airport": "CD",
                 "small_airport": "DE"}.get(t, "E")
     if t == "large_airport":
         return "C"
@@ -1210,7 +1273,8 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
     in_market = event_dist_nm is not None
 
     # Destination quality — the discriminator inside a flat fullness band.
-    parts["quality"] = quality_score(ap)
+    parts["quality"] = quality_score(ap, tail["cls"],
+                                     ap["ident"] in doc.preferred)
 
     # Fullness.
     fullness = block_h / ceiling_h if ceiling_h > 0 else 0
@@ -1283,9 +1347,12 @@ def print_rules() -> None:
     print(f"  {'below the floor':<{w}} not offered "
           f"(in-market legs and home base exempt, scored in-band)")
     print("\nDestination quality (airport `type` is deliberately not scored)")
-    print("  runway anchors (ft -> pts)   "
-          + ", ".join(f"{int(x)}:{y:+.0f}" for x, y in QUALITY_RWY_ANCHORS))
+    for cls, anchors in QUALITY_RWY_ANCHORS.items():
+        print(f"  {'runway ' + cls + ' (ft:pts)':<{w}} "
+              + ", ".join(f"{int(x)}:{y:+.0f}" for x, y in anchors))
     print(f"  {'scheduled service':<{w}} {QUALITY_SCHEDULED:+.0f}")
+    print(f"  {'PREFERRED FIELDS':<{w}} {QUALITY_MAX:.0f} (the cap)")
+    print(f"  {'military, no service':<{w}} not offered unless preferred")
     print(f"\nEvent market radius            {EVENT_RADIUS_NM} nm (flag only, "
           f"no score)")
     print(f"Sun window                     ±{SUN_WINDOW_MIN} min of sunrise/sunset")
@@ -1391,6 +1458,11 @@ def main() -> int:
                 print(f"error: THE FLEET {f['tail']} {col} {f[col]} is not in the "
                       f"airport database", file=sys.stderr)
                 return 3
+    unknown = sorted(i for i in doc.preferred if i not in airports)
+    if unknown:
+        print(f"error: PREFERRED FIELDS lists {', '.join(unknown)}, not in the "
+              f"airport database", file=sys.stderr)
+        return 3
     manifest = doc.manifest(airports)
 
     if args.finalize:
@@ -1494,6 +1566,12 @@ def main() -> int:
             gc = gc_nm(cur["lat"], cur["lon"], a["lat"], a["lon"])
             if gc < 1:
                 continue
+            # A model's MODEL LIMITS `Max GC` caps a leg below what the fuel
+            # check alone allows (the Falcon 50 falls short of reserves well
+            # inside its published range). A fallback ferry is exempt: real
+            # ferries use tech stops, and nothing may strand an aircraft.
+            if lim["max_gc"] and gc > lim["max_gc"]:
+                continue
             route = gc * ROUTE_FACTOR
             block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
             if block > ceiling + BAND_OVER_H:
@@ -1540,6 +1618,7 @@ def main() -> int:
                 "dest_region": dest_region,
                 "dest_class": eff,
                 "class_verified": ident in doc.class_register,
+                "preferred": ident in doc.preferred,
                 "dest_rwy_ft": a["rwy"],
                 "dest_type": a["type"],
                 "water": a["water"],

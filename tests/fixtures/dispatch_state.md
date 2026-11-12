@@ -1,5 +1,5 @@
 # dispatch_state.md
-Schema v6.2 · RULES.md v7.0 · 12 NOV 2026
+Schema v6.3 · RULES.md v7.1 · 12 NOV 2026
 
 Machine-readable state. `dispatch_calc.py` parses **this file** — THE FLEET,
 MODEL LIMITS, REGION TABLE, AIRPORT CLASS REGISTER, THE LOGBOOK — not RULES.md.
@@ -138,19 +138,19 @@ model, not per tail. Confirmed 11 SEP 2026 against ten airframe screenshots;
 BBJ1 baggage and Falcon 50 (full row) confirmed 23 SEP 2026; Hawker 800 BOW
 and Baggage re-confirmed against the in-sim figures 25 SEP 2026.
 
-| Model | ICAO | Seats | BOW | MZFW | MTOW | MLW | Max fuel | Baggage | Plan burn | Reserve |
-|---|---|---|---|---|---|---|---|---|---|---|
-| Citation Sovereign+ | C680 | 9 | 18781 | 21000 | 30775 | 27575 | 11390 | 1000 | 1350 | 1750 |
-| Citation X | C750 | 9 | 22481 | 24400 | 36100 | 31800 | 12931 | 775 | 1900 | 2500 |
-| 737-700 BBJ | B737 | 19 | 96625 | 126000 | 171500 | 134000 | 71662 | 29375 | 5000 | 6500 |
-| 737-800 BBJ2 | B738 | 19 | 102187 | 138300 | 174700 | 146300 | 69980 | 17645 | 5300 | 6900 |
-| Caravan (cargo pod) | C208 | 9 | 4237 | 8500 | 8750 | 8500 | 2224 | 1400 | 370 | 370 |
-| Caravan (amphibious) | C208 | 8 | 5380 | 8800 | 9062 | 9062 | 2224 | 500 | 390 | 390 |
-| TBM 850 | TBM8 | 5 | 4629 | 6032 | 7394 | 7024 | 1957 | 330 | 400 | 400 |
-| Starship 2000A | STAR | 6 | 10085 | 12600 | 14900 | 13680 | 3752 | 400 | 750 | 750 |
-| Royal Turbine Duke | B60T | 5 | 4553 | 7000 | 7000 | 7000 | 1595 | 400 | 430 | 430 |
-| Hawker 800 | H25B | 8 | 16010 | 18450 | 28000 | 23350 | 9956 | 250 | 1500 | 1950 |
-| Falcon 50 | FA50 | 9 | 22741 | 25570 | 40780 | 35715 | 15513 | 2829 | 2125 | 1508 |
+| Model | ICAO | Seats | BOW | MZFW | MTOW | MLW | Max fuel | Baggage | Plan burn | Reserve | Max GC |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Citation Sovereign+ | C680 | 9 | 18781 | 21000 | 30775 | 27575 | 11390 | 1000 | 1350 | 1750 | — |
+| Citation X | C750 | 9 | 22481 | 24400 | 36100 | 31800 | 12931 | 775 | 1900 | 2500 | — |
+| 737-700 BBJ | B737 | 19 | 96625 | 126000 | 171500 | 134000 | 71662 | 29375 | 5000 | 6500 | — |
+| 737-800 BBJ2 | B738 | 19 | 102187 | 138300 | 174700 | 146300 | 69980 | 17645 | 5300 | 6900 | — |
+| Caravan (cargo pod) | C208 | 9 | 4237 | 8500 | 8750 | 8500 | 2224 | 1400 | 370 | 370 | — |
+| Caravan (amphibious) | C208 | 8 | 5380 | 8800 | 9062 | 9062 | 2224 | 500 | 390 | 390 | — |
+| TBM 850 | TBM8 | 5 | 4629 | 6032 | 7394 | 7024 | 1957 | 330 | 400 | 400 | — |
+| Starship 2000A | STAR | 6 | 10085 | 12600 | 14900 | 13680 | 3752 | 400 | 750 | 750 | — |
+| Royal Turbine Duke | B60T | 5 | 4553 | 7000 | 7000 | 7000 | 1595 | 400 | 430 | 430 | — |
+| Hawker 800 | H25B | 8 | 16010 | 18450 | 28000 | 23350 | 9956 | 250 | 1500 | 1950 | — |
+| Falcon 50 | FA50 | 9 | 22741 | 25570 | 40780 | 35715 | 15513 | 2829 | 2125 | 1508 | 1550 |
 
 - **Royal Turbine Duke** — MZFW equals MTOW: SimBrief declares no separate
   zero-fuel limit, so fuel competes directly against MTOW and payload moves
@@ -175,11 +175,16 @@ and Baggage re-confirmed against the in-sim figures 25 SEP 2026.
 - **Caravans, TBM 850, Starship** — Baggage is published-spec or
   developer-statement derived, the softest figures here.
 
+**Max GC** caps a model's great-circle leg below what the fuel check allows;
+`—` means no cap. The script drops longer candidates and `--finalize` flags a
+longer pick. A fallback ferry is exempt, since a real ferry takes a tech stop.
+
 **Falcon 50 real range is well under the published 3,057 nm.** KTEB–KSEA
 (2,082 nm GC) and KLAX–KTEB (2,132 nm GC) both drew SimBrief's range warning
 and came up short of reserves at max fuel; KELP–KTEB (1,644 nm GC) planned
-clean with no margin. Treat anything beyond roughly 1,600 nm GC as needing a
-tech stop. A leg between 1,644 and 2,082 nm would narrow the ceiling.
+clean with no margin — eastbound, with the usual tailwind. Max GC is set at
+1,550 nm (12 NOV 2026) to keep a margin for a westbound headwind the board
+cannot model. A clean westbound OFP beyond it would justify raising it.
 
 ### REGION TABLE
 
@@ -218,9 +223,11 @@ scores no affinity and always counts as a new region.
 
 ### AIRPORT CLASS REGISTER
 
-Sorted by ICAO. An airport earns an entry when it first reaches a final board or
-first appears in THE LOGBOOK by another route. Verification rules are in
-RULES.md → THE AIRPORT DATABASE.
+Sorted by ICAO. Holds every US Class B airport — the 37 primaries, checked
+against the FAA list 12 NOV 2026, plus Nellis (KLSV) and Love Field (KDAL),
+which sit inside a primary's Class B surface area — and any other field whose
+class has been verified. An unlisted field flies on its proxy class, and no
+unlisted US field is Class B. Rules are in RULES.md → THE AIRPORT DATABASE.
 
 | ICAO | Class | Verified |
 |---|---|---|
@@ -280,6 +287,62 @@ RULES.md → THE AIRPORT DATABASE.
 | KVKS | E | 19 SEP 2026 |
 | MYGF | C | 18 SEP 2026 |
 | PHNL | B | 12 SEP 2026 |
+
+### PREFERRED FIELDS
+
+Kyle's preferred destinations. Each scores the destination-quality cap, so it
+ranks level with the best airline airports, and a listed military field is
+exempt from the military exclusion. The list ranks legal fields only: a field
+that fails a tail's `Min rwy`, field quality, tier or Class B rule stays off
+that tail's board regardless. Every ICAO must exist in the airport data
+(checked every run). Scenery fields that are Class B (KDFW, KDAL, KIAH, KHOU,
+KMSY) are left off because no jet may take them without `--allow-b`.
+
+| ICAO | Note |
+|---|---|
+| KADS | reliever — Dallas |
+| KAPA | reliever — Denver |
+| KAPC | resort — Napa |
+| KAPF | resort — Naples |
+| KASE | resort — Aspen |
+| KBCT | reliever — Boca Raton |
+| KBED | reliever — Boston |
+| KBUR | reliever — Los Angeles |
+| KDTO | reliever — Dallas |
+| KDWH | reliever — Houston |
+| KEGE | resort — Vail |
+| KFRG | reliever — New York |
+| KFXE | reliever — Fort Lauderdale |
+| KHDN | resort — Steamboat |
+| KHEF | reliever — Washington |
+| KHPN | reliever — New York |
+| KJYO | reliever — Washington |
+| KLUK | reliever — Cincinnati |
+| KMKC | reliever — Kansas City |
+| KMMU | reliever — New York |
+| KMRY | resort — Monterey |
+| KOPF | reliever — Miami |
+| KPDK | reliever — Atlanta |
+| KPWK | reliever — Chicago |
+| KSDL | reliever — Phoenix |
+| KSGR | reliever — Houston |
+| KSUN | resort — Sun Valley |
+| KSUS | reliever — St. Louis |
+| KTEB | reliever — New York |
+| KTEX | resort — Telluride |
+| KTKI | reliever — Dallas |
+| KTMB | reliever — Miami |
+| KTRK | resort — Lake Tahoe |
+| KVNY | reliever — Los Angeles |
+| KABQ | scenery |
+| KAMA | scenery |
+| KAUS | scenery |
+| KBHM | scenery |
+| KELP | scenery |
+| KOKC | scenery |
+| KRVS | scenery |
+| KSAT | scenery |
+| KTUL | scenery |
 
 ## THE LOGBOOK
 
