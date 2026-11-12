@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v6.8).
+dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.0).
 
 Reads dispatch_state.md for state: THE FLEET, MODEL LIMITS, REGION TABLE,
 AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the single source of truth
@@ -20,34 +20,42 @@ Three modes:
               sun times, `--json-out FILE` to save the JSON while printing
               the table, so one run serves both.
 
-  Finalize    `--finalize picks.json` takes the story picks — tail, dest,
-              local departure time, pax, cargo — and returns everything a
-              card needs: Zulu and local departure, Zulu date, the five-way
-              day-part from real sun times, the RULE 1 icon, block, session,
-              a payload check, and the finished SimBrief URL. No --hours.
+  Finalize    `--finalize picks.json --hours X` takes the story picks — tail,
+              dest, local departure time, pax, cargo — runs each through the
+              same legality gate as the candidate loop, and returns
+              everything a card needs: Zulu and local departure, Zulu date,
+              the five-way day-part from real sun times, the RULE 1 icon,
+              block, session, a payload check, and the finished SimBrief URL.
 
   Rules       `--rules` prints the constants.
 
-Left to Dispatch: the event bonus, the story, job type, the chosen pax, cargo
-and departure time, and board composition.
+Every run starts with a preflight: required CSV columns, a floor on airports
+with a runway, and parsed state counts, reported as one `state:` manifest
+line. A failed preflight is exit 3 with the cause named — never a silent
+empty result. `--expect VERSION` halts with exit 5 when the RULES.md version
+the session loaded differs from SCRIPT_VERSION.
+
+Left to Dispatch: the story, job type, the chosen pax, cargo and departure
+time, event verification, and board composition.
 
 Usage
 -----
-  python3 dispatch_calc.py --hours 3.5 --table --json-out cands.json
-  python3 dispatch_calc.py --hours 4 --tail N24SM --json
-  python3 dispatch_calc.py --finalize picks.json --hours 3.5
+  python3 dispatch_calc.py --expect 7.0 --hours 2.5 --tail N24SM --table --json-out cands.json
+  python3 dispatch_calc.py --expect 7.0 --finalize picks.json --hours 2.5
 
 picks.json is a list of objects:
-  {"tail": "N24SM", "dest": "KMEM", "dep_local": "18:05",
+  {"tail": "N24SM", "dest": "KAEX", "dep_local": "18:05",
    "pax": 4, "cargo": 40, "date": "21OCT26"}
 `dep` defaults to the tail's Current; `date` is the LOCAL departure date at
-the departure airport (DDMMMYY) and defaults to today there. Pass `--hours`
-with --finalize to check each pick against the fullness band; mark a
-positioning leg into a verified event market `"exempt": true` (home-base legs
-are exempt automatically).
+the departure airport (DDMMMYY) and defaults to today there. `--hours` is
+required. `"exempt": true` lifts the fullness floor for a positioning leg and
+is honoured only when `--event` is also given and the destination lies inside
+the event radius; home-base legs are exempt automatically. `"ferry": true`
+lets the amphibious Caravan take a runway destination.
 
 Exit codes: 0 ok, 2 no legal candidates, 3 parse/data error,
-4 finalize found a pick that fails a check (details in its `problems`).
+4 finalize found a pick that fails a check (details in its `problems`),
+5 version mismatch (--expect).
 """
 
 from __future__ import annotations
@@ -61,6 +69,15 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+SCRIPT_VERSION = "7.0"       # must equal the RULES.md version; see --expect
+STATE_SCHEMA = "6.2"         # must equal dispatch_state.md's "Schema v" header
+HOME_TZ = "America/New_York" # Kyle's zone: the default --date is his local date
+
+
+class DataError(Exception):
+    """A state or airport-data problem. Always exit 3 with the cause named."""
+
 
 # ---------------------------------------------------------------------------
 # Scoring and timing constants. This file is their only home; RULES.md says
@@ -135,13 +152,14 @@ LARGE_JET_CLASS_D_MIN_RWY = 7000
 # Min rwy alone.
 FIELD_MIN_WIDTH_FT = 75
 
-# Fields renamed after OurAirports last updated, keyed new ident -> old ident.
-# The old record is re-keyed under the new ident so a tail homed at the new
-# ident resolves, and the old ident stops appearing as a separate destination.
-# Delete an entry once OurAirports carries the new ident itself.
-IDENT_ALIASES = {
-    "KDJT": "KPBI",   # Palm Beach Intl, renamed 23 SEP 2026 in dispatch_state.md
-}
+# Ident re-keying. OurAirports keeps a field's original `ident` after it is
+# renamed and records the new code in `icao_code` (KPBI -> KDJT, Palm Beach,
+# 2026). Any row whose `icao_code` is a four-letter code differing from its
+# ident, and not already some other row's ident, is re-keyed under the ICAO
+# code: a tail homed at the new code resolves, SimBrief receives the code it
+# expects, and the old ident stops appearing as a separate destination. This
+# replaces the hand-kept alias table, which needed an edit for every rename.
+ICAO_RE = re.compile(r"^[A-Z]{4}$")
 
 PAVED_PREFIXES = ("ASP", "CON", "PEM", "BIT", "TAR", "COM", "PER", "PSP", "MAC")
 
@@ -166,23 +184,20 @@ def field_quality_ok(ap: dict) -> bool:
 # Dispatch passes each field (--event KPHX --event KSDL) rather than widening
 # the ring.
 #
-# The bonus is 0 as of v6.2. It was +40, set when a positioning ferry was the
-# only route by which an event reached a board. At that value an in-market leg
-# scored ~100 against a non-event cluster near 60 — an automatic win for the one
-# card type whose payoff lands in a later session that may never happen, bought
-# silently on every board where any event verified. RULES.md now reserves the
-# event slot outright and fills it with a revenue leg by default, so the event
-# card no longer has to win on points, and the positioning leg is gated on ops
-# mode, outbound window and story rather than priced. The constant survives at 0
-# so --rules still names the component and so restoring a value stays one edit.
+# A destination inside the radius of an --event airport is `in_market`, and its
+# `event_dist_nm` says how far from the event field it sits. That flag is the
+# whole output: no event bonus is scored (it was +40 to v6.2, then 0, and was
+# removed in v7.0). RULES.md reserves the event slot outright, fills it with a
+# revenue leg by default, and gates an empty positioning leg on ops mode,
+# outbound window and story — none of which a score can express.
 #
-# The floors below are NOT part of the bonus and stay. A positioning leg is short
-# and empty by nature, so it earns little or no fullness credit, and it flies
+# In-market records keep two neutralisations. A positioning leg is short and
+# empty by nature, so it would fall below the fullness floor, and it flies
 # toward exactly the region the variety engine is busy penalizing — the event is
-# what concentrated traffic there in the first place. Flooring those two at zero
-# removes a penalty the leg does not deserve; it does not award anything.
+# what concentrated traffic there in the first place. Scoring it as in-band and
+# flooring its region term at zero removes penalties the leg does not deserve;
+# it does not award anything.
 EVENT_RADIUS_NM = 50
-EVENT_POSITIONING_BONUS = 0
 
 # Scoring constants. RULES.md documents what each component MEANS; the values
 # live only here, so there is nothing to keep in sync. --rules prints them.
@@ -197,9 +212,14 @@ HOME_BASED_TOWARD = 20       # based tail, destination is toward home
 HOME_REGIONAL_HOME = 30      # regional tail outside its region, home field
 HOME_REGIONAL_REGION = 25    # regional tail outside its region, home region
 HOME_REGIONAL_TOWARD = 10    # regional tail outside its region, toward home
-AFFINITY_BONUS = 10          # destination region in the class's affinity list
-MODEL_ROTATION_PENALTY = -15 # same model as the last logged flight
-EVENT_VERIFIED_BONUS = 25    # applied by Dispatch, not by this script
+AFFINITY_BONUS = 10          # destination region not excluded for the class
+# Model rotation was retired in v7.0: Kyle names the aircraft each session, so
+# equipment rotation is no longer wanted. Region and destination recency stay.
+
+# Candidates reported per tail when --top is not given. One default now that
+# a board is built for the aircraft Kyle names rather than a fleet-wide spread.
+TOP_DEFAULT = 12
+TOP_MAX = 30
 
 # Fullness band, in ABSOLUTE minutes against the ceiling — not a fraction of it.
 # Kyle's tolerance is "15 minutes short is fine, 5 minutes over is fine" and that
@@ -213,10 +233,9 @@ EVENT_VERIFIED_BONUS = 25    # applied by Dispatch, not by this script
 # accident.
 #
 # Inside the band every candidate scores the same, and DESTINATION QUALITY below
-# does the discriminating. That is the v4.2 failure mode inverted rather than
-# repeated: v4.2's step bands tied at the top and fell through to TYPE_RANK,
-# which pulled toward hubs; here the tie-break is an explicit quality term that
-# ranks medium_airport ABOVE large_airport, so it pulls toward relievers.
+# does the discriminating, from runway length and scheduled service. It does not
+# read airport `type` and does not favour relievers over hubs — a hub wins on
+# both signals — so the reliever preference stays a board-time judgment.
 BAND_UNDER_H = 0.25          # 15 min: full credit this far under the ceiling
 BAND_OVER_H = 5.0 / 60.0     # 5 min: allowed to exceed the ceiling by this much
 BAND_FULL_PTS = 20.0         # flat credit anywhere inside the band
@@ -283,16 +302,6 @@ TYPE_RANK = {"large_airport": 3, "medium_airport": 2, "small_airport": 1,
              "seaplane_base": 1}
 MAX_PER_REGION_REPORTED = 3
 
-DAY_PARTS = [
-    ("early morning", 5, 8),
-    ("daylight", 8, 17),
-    ("evening", 17, 20),
-    ("night", 20, 5),
-]
-# DAY_PARTS above only labels the --depz placeholder. Story departures use the
-# five day-parts in RULES.md → VARIETY ENGINE → Departure time, computed below
-# from the real sun at the departure airport.
-
 SUN_WINDOW_MIN = 45            # sunrise/sunset window, either side of the event
 DAY_PART_ICON = {
     "sunrise": "ti-sunrise",
@@ -345,7 +354,68 @@ def cargo_klbs(lbs: int) -> str:
     return f"{lbs / 1000:.3f}".rstrip("0").rstrip(".")
 
 
-def finalize(args, doc, airports, tf) -> int:
+def water_only(tail: dict) -> bool:
+    """The amphibian's revenue missions deliver to water (THE FLEET tail note)."""
+    return "amphibious" in tail["model"].lower()
+
+
+def destination_gate(a: dict, tail: dict, doc, *, allow_small: bool,
+                     land: bool, ferry: bool = False):
+    """The legality gate, shared by the candidate loop and --finalize.
+
+    Returns (problems, eff_class, class_b). Verified Class B is reported
+    separately rather than as a problem: the candidate loop drops it unless
+    --allow-b, while a finalize pick may carry it when the story demands the
+    hub (AIRSPACE ROUTING RULES) and gets a note instead.
+    """
+    problems = []
+    ident = a["ident"]
+    is_home = ident == tail["home"]
+    eff = doc.class_register.get(ident, proxy_class(a))
+    amphib = water_only(tail)
+
+    if amphib and not land and not ferry:
+        if not a["water"]:
+            problems.append(f"{ident} has no water landing area; the amphibian's "
+                            f"revenue missions deliver to water")
+        return problems, eff, False
+    if amphib and ferry and a["water"]:
+        return problems, eff, False       # a ferry may also end on water
+    if a["type"] == "seaplane_base":
+        problems.append(f"{ident} is a seaplane base")
+    if a["rwy"] < tail["min_rwy"]:
+        problems.append(f"{ident} longest land runway {a['rwy']} ft is below "
+                        f"Min rwy {tail['min_rwy']} ft")
+    if not allow_small and not is_home and not field_quality_ok(a):
+        problems.append(f"{ident} fails the field quality gate (paved, "
+                        f"{FIELD_MIN_WIDTH_FT} ft wide)")
+    class_b = False
+    if not is_home:
+        if eff == "B":
+            class_b = True
+        elif not tier_ok(a, eff, tail["cls"], False):
+            problems.append(f"{ident} class {eff} is outside the {tail['cls']} "
+                            f"tiers")
+    return problems, eff, class_b
+
+
+def _int_field(p: dict, key: str, problems: list) -> int:
+    v = p.get(key, 0)
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        problems.append(f"{key} must be a whole number, got {v!r}")
+        return 0
+    try:
+        n = int(str(v).strip() or 0)
+    except ValueError:
+        problems.append(f"{key} must be a whole number, got {v!r}")
+        return 0
+    if n < 0:
+        problems.append(f"{key} cannot be negative")
+        return 0
+    return n
+
+
+def finalize(args, doc, airports, tf, manifest: str) -> int:
     try:
         with open(args.finalize, encoding="utf-8") as fh:
             picks = json.load(fh)
@@ -354,44 +424,93 @@ def finalize(args, doc, airports, tf) -> int:
         return 3
     if isinstance(picks, dict):
         picks = picks.get("picks", [picks])
+    if not isinstance(picks, list):
+        picks = [picks]
     if tf is None:
         print("timezonefinder is required for --finalize", file=sys.stderr)
         return 3
 
+    event_pts = [airports[e.upper()] for e in args.event if e.upper() in airports]
     fleet = {f["tail"].upper(): f for f in doc.fleet}
     out, notes, failed = [], [], False
+    ceil_f = args.hours - CEILING_MARGIN_H
+
+    def reject(n, msg, tail_id=None):
+        rec = {"pick": n, "problems": [msg]}
+        if tail_id:
+            rec["tail"] = tail_id
+        out.append(rec)
+
     for n, p in enumerate(picks, 1):
+        if not isinstance(p, dict):
+            reject(n, f"pick must be an object, got {p!r}")
+            failed = True
+            continue
         problems = []
         tail = fleet.get(str(p.get("tail", "")).upper())
         if tail is None:
-            out.append({"pick": n, "problems": [f"unknown tail {p.get('tail')}"]})
+            reject(n, f"unknown tail {p.get('tail')!r}")
             failed = True
             continue
         dep = str(p.get("dep") or tail["current"]).upper()
         dest = str(p.get("dest", "")).upper()
         cur, a = airports.get(dep), airports.get(dest)
         if cur is None or a is None:
-            out.append({"pick": n, "tail": tail["tail"], "problems":
-                        [f"{dep if cur is None else dest} not in the airport database"]})
+            reject(n, f"{dep if cur is None else dest or '(blank dest)'} not in "
+                      f"the airport database", tail["tail"])
+            failed = True
+            continue
+        if dest == dep:
+            reject(n, "destination is the departure airport", tail["tail"])
             failed = True
             continue
         lim = doc.limits_for(tail["model"])
         pax_allow = PAX_ALLOWANCE_LB_OVERRIDE.get(lim["icao"], PAX_ALLOWANCE_LB)
         bag_pp = BAG_PER_PAX_LB_OVERRIDE.get(lim["icao"], BAG_PER_PAX_LB)
 
+        # The same gate the candidate loop applies. A pick that could never
+        # have appeared as a candidate does not become legal by being typed.
+        gate, eff, class_b = destination_gate(
+            a, tail, doc, allow_small=args.allow_small_fields, land=args.land,
+            ferry=bool(p.get("ferry")))
+        problems.extend(gate)
+        if class_b:
+            if args.allow_b:
+                notes.append(f"pick {n}: {dest} is Class B in the register — "
+                             f"only if the story demands it (AIRSPACE ROUTING "
+                             f"RULES)")
+            else:
+                problems.append(f"{dest} is Class B in the register; rerun "
+                                f"with --allow-b only if the story demands it")
+        if a["country"] == "CU" or cur["country"] == "CU":
+            notes.append(f"pick {n}: Cuban leg — the hook must name an OFAC "
+                         f"authorized category; tourist travel is prohibited")
+
         gc = gc_nm(cur["lat"], cur["lon"], a["lat"], a["lon"])
         route = gc * ROUTE_FACTOR
         block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
-        pax, cargo = int(p.get("pax", 0)), int(p.get("cargo", 0))
-        if args.hours is not None:
-            ceil_f = args.hours - CEILING_MARGIN_H
-            if block > ceil_f + BAND_OVER_H:
-                problems.append(f"block {fmt_hm(block)} is over the "
-                                f"{fmt_hm(ceil_f)} ceiling")
-            elif (block < ceil_f - BAND_UNDER_H and dest != tail["home"]
-                  and not p.get("exempt")):
-                problems.append(f"block {fmt_hm(block)} is below the fullness "
-                                f"band for a {fmt_hm(ceil_f)} ceiling")
+        pax = _int_field(p, "pax", problems)
+        cargo = _int_field(p, "cargo", problems)
+
+        in_market = None
+        for ea in event_pts:
+            d = 0.0 if ea["ident"] == dest else gc_nm(a["lat"], a["lon"],
+                                                       ea["lat"], ea["lon"])
+            if d <= args.event_radius and (in_market is None or d < in_market):
+                in_market = d
+        exempt = dest == tail["home"]
+        if p.get("exempt"):
+            if in_market is None:
+                problems.append("\"exempt\" needs --event with the destination "
+                                "inside the event radius")
+            else:
+                exempt = True
+        if block > ceil_f + BAND_OVER_H:
+            problems.append(f"block {fmt_hm(block)} is over the "
+                            f"{fmt_hm(ceil_f)} ceiling")
+        elif block < ceil_f - BAND_UNDER_H and not exempt:
+            problems.append(f"block {fmt_hm(block)} is below the fullness "
+                            f"band for a {fmt_hm(ceil_f)} ceiling")
         feas = feasibility(lim, block)
         room = None
         if feas is None:
@@ -407,26 +526,33 @@ def finalize(args, doc, airports, tf) -> int:
 
         tzname = tf.timezone_at(lat=cur["lat"], lng=cur["lon"])
         if not tzname:
-            out.append({"pick": n, "tail": tail["tail"],
-                        "problems": [f"no time zone for {dep}"]})
+            reject(n, f"no time zone for {dep}", tail["tail"])
             failed = True
             continue
         tz = ZoneInfo(tzname)
         if p.get("date"):
-            ld = datetime.strptime(str(p["date"]), "%d%b%y").date()
+            try:
+                ld = datetime.strptime(str(p["date"]).strip(), "%d%b%y").date()
+            except ValueError:
+                reject(n, f"date must be DDMMMYY, got {p['date']!r}", tail["tail"])
+                failed = True
+                continue
         else:
             ld = datetime.now(tz).date()
         hhmm = str(p.get("dep_local", "")).replace(":", "").strip()
-        if len(hhmm) != 4 or not hhmm.isdigit():
-            out.append({"pick": n, "tail": tail["tail"],
-                        "problems": ["dep_local must be HH:MM"]})
+        if (len(hhmm) != 4 or not hhmm.isdigit() or int(hhmm[:2]) > 23
+                or int(hhmm[2:]) > 59):
+            reject(n, "dep_local must be HH:MM", tail["tail"])
             failed = True
             continue
         mins = int(hhmm[:2]) * 60 + int(hhmm[2:])
-        rounded = int(round(mins / 5.0)) * 5 % (24 * 60)
+        rounded = int(round(mins / 5.0)) * 5
         if rounded != mins:
             notes.append(f"pick {n}: {hhmm[:2]}:{hhmm[2:]} rounded to the "
                          f"nearest 5 minutes")
+        if rounded >= 24 * 60:            # 23:58 rounds into the next day
+            rounded -= 24 * 60
+            ld = ld + timedelta(days=1)
         dep_l = datetime(ld.year, ld.month, ld.day, rounded // 60, rounded % 60,
                          tzinfo=tz)
         dep_z = dep_l.astimezone(timezone.utc)
@@ -439,14 +565,13 @@ def finalize(args, doc, airports, tf) -> int:
                                    depm=f"{dep_z.minute:02d}")
                .replace("{PAX}", str(pax))
                .replace("{CARGO_KLBS}", cargo_klbs(cargo)))
-        if doc.class_register.get(dest) == "B" and dest != tail["home"]:
-            notes.append(f"pick {n}: {dest} is Class B in the register — "
-                         f"only if the story demands it (AIRSPACE ROUTING RULES)")
         failed = failed or bool(problems)
         out.append({
             "pick": n, "tail": tail["tail"], "model": tail["model"],
             "icao_type": tail["icao"], "dep": dep, "dep_city": cur["muni"],
             "dest": dest, "dest_city": a["muni"], "dest_name": a["name"],
+            "dest_class": eff, "in_market": in_market is not None,
+            "event_dist_nm": None if in_market is None else round(in_market),
             "gc_nm": round(gc), "route_nm": round(route),
             "block": fmt_hm(block), "session": fmt_hm(block + PREP_H),
             "pax": pax, "cargo": cargo, "cargo_room_at_pax": room,
@@ -471,12 +596,15 @@ def finalize(args, doc, airports, tf) -> int:
                 notes.append(f"{c} cards in the {part} day-part; the cap is 2")
         if len(good) > 1 and not any(r["sun_edge"] for r in good):
             notes.append("no sun-edge card on this board")
-    print(json.dumps({"notes": notes, "picks": out}, indent=2))
+    print(json.dumps({"version": SCRIPT_VERSION, "manifest": manifest,
+                      "notes": notes, "picks": out}, indent=2))
     return 4 if failed else 0
 
 
-def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date):
+def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date,
+                manifest):
     """Step-6 decision table: one block per tail, plus departure sun times."""
+    print(f"dispatch_calc v{SCRIPT_VERSION} · {manifest}")
     print(f"Block ceiling {fmt_hm(ceiling)} · date {date_ddmmmyy} · "
           f"{len(results)} candidates")
     for n in notes:
@@ -512,14 +640,14 @@ def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date
             flags = []
             if c.get("fallback"):
                 flags.append("FALLBACK")
-            if c["positioning"]:
-                flags.append("POS")
             if c["event_dist_nm"] is not None:
                 flags.append(f"EV{c['event_dist_nm']}")
             if c["event_tie_available"]:
                 flags.append("EV-OUT")
             if c["toward_home"]:
                 flags.append("home-ward")
+            if c["dest"] == c["home"]:
+                flags.append("HOME")
             q = c["score_parts"].get("quality", 0)
             cl = c["dest_class"] + ("" if c["class_verified"] else "?")
             print(f"  {c['dest']:<5} {c['dest_city'][:18]:<18} "
@@ -530,7 +658,7 @@ def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date
                   f"{c['cargo_room_at_max_pax']:>5} {c['score']:>6g} "
                   + " ".join(flags))
     print("\nCL '?' = proxy class, unverified. CGO = freight room at max pax. "
-          "Departure times here are placeholders; use --finalize for card times.")
+          "EV<nm> = in the event market. Card times come only from --finalize.")
 
 
 # ---------------------------------------------------------------------------
@@ -542,23 +670,34 @@ def _split_row(line: str) -> list[str]:
     return [p.strip() for p in parts]
 
 
-def parse_table(text: str, header: str) -> list[dict]:
-    """Return the first markdown table appearing under `header` as list of dicts."""
+def parse_table(text: str, header: str, first_col: str | None = None,
+                required: tuple = ()) -> list[dict]:
+    """Return a markdown table under section `header` as a list of dicts.
+
+    Takes the first table in the section, or the first whose header row starts
+    with `first_col`. A blank line inside a table does not end it — a stray
+    blank line used to truncate THE FLEET silently — but any other non-table
+    line does, so the prose and the second table that follow a table are never
+    merged into it. Every column in `required` must be present.
+    """
     pat = re.compile(r"^#{1,4}\s+" + re.escape(header) + r"\s*$", re.M)
     m = pat.search(text)
     if not m:
-        raise KeyError(f"section not found in document: {header}")
+        raise DataError(f"section not found in state file: {header}")
     rest = text[m.end():]
     stop = re.search(r"^#{1,4}\s+\S", rest, re.M)
     if stop:
         rest = rest[: stop.start()]
 
-    rows, cols = [], None
+    tables, rows, cols = [], [], None
     for line in rest.splitlines():
         s = line.strip()
+        if not s:
+            continue
         if not s.startswith("|"):
             if cols is not None:
-                break          # table ended
+                tables.append((cols, rows))
+                rows, cols = [], None
             continue
         cells = _split_row(s)
         if cols is None:
@@ -569,9 +708,17 @@ def parse_table(text: str, header: str) -> list[dict]:
         if len(cells) < len(cols):
             cells += [""] * (len(cols) - len(cells))
         rows.append(dict(zip(cols, cells[: len(cols)])))
-    if cols is None:
-        raise KeyError(f"no table under section: {header}")
-    return rows
+    if cols is not None:
+        tables.append((cols, rows))
+
+    for cols, rows in tables:
+        if first_col is None or (cols and cols[0] == first_col):
+            missing = [c for c in required if c not in cols]
+            if missing:
+                raise DataError(f"{header}: missing column(s) {', '.join(missing)}")
+            return rows
+    want = f" starting with column {first_col!r}" if first_col else ""
+    raise DataError(f"no table{want} under section: {header}")
 
 
 def _num(v: str, cast=float, default=None):
@@ -588,59 +735,101 @@ def _num(v: str, cast=float, default=None):
 # Document model
 # ---------------------------------------------------------------------------
 
+CLASSES = ("turboprop", "mid_jet", "large_jet")
+OPS_MODES = ("based", "regional", "floating")
+STATUSES = ("active", "stored")
+ROUTE_RE = re.compile(r"^\s*([A-Z0-9]{3,4})\s*(?:→|->|[-–—])\s*([A-Z0-9]{3,4})\s*$")
+
+
+def _req_num(table: str, key: str, field: str, v: str, cast=float):
+    """A required numeric cell: a bad value is exit 3 with the cell named."""
+    n = _num(v, cast)
+    if n is None:
+        raise DataError(f"{table}: {key} has a non-numeric {field} ({v!r})")
+    return n
+
+
 class Doc:
     def __init__(self, path: str):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
         self.path = path
 
+        # Schema handshake. The script parses this file by section name and
+        # column name; a state file from another schema fails here, by name,
+        # rather than parsing into something subtly wrong.
+        m = re.search(r"Schema v([\d.]+)", text)
+        self.schema = m.group(1) if m else None
+        if self.schema != STATE_SCHEMA:
+            raise DataError(f"state schema {self.schema or '(none)'} != "
+                            f"{STATE_SCHEMA} expected by script v{SCRIPT_VERSION}")
+
         self.fleet = []
-        for r in parse_table(text, "THE FLEET"):
+        for r in parse_table(text, "THE FLEET", "Tail", required=(
+                "Tail", "Model", "ICAO", "Class", "Ops", "Status", "Plan KTAS",
+                "Min rwy", "Home", "Current", "Away")):
             if not r.get("Tail"):
                 continue
-            self.fleet.append({
-                "tail": r["Tail"],
-                "model": r["Model"],
-                "icao": r["ICAO"],
-                "cls": r["Class"],
-                "ops": (r.get("Ops") or "floating").strip().lower(),
-                "status": (r.get("Status") or "active").strip().lower(),
-                "ktas": _num(r["Plan KTAS"]),
-                "min_rwy": _num(r["Min rwy"], int, 0),
-                "home": r["Home"],
-                "current": r["Current"],
-                "away": _num(r["Away"], int, 0),
-                # v6.0: no longer tracked. Read if present so an older state
-                # file still parses, but never required.
-                "hobbs": _num(r.get("Hobbs", ""), float, 0.0),
-                "flts": _num(r.get("Flts", ""), int, 0),
-            })
+            t = r["Tail"].strip()
+            rec = {
+                "tail": t,
+                "model": r["Model"].strip(),
+                "icao": r["ICAO"].strip(),
+                "cls": r["Class"].strip(),
+                "ops": r["Ops"].strip().lower(),
+                "status": r["Status"].strip().lower(),
+                "ktas": _req_num("THE FLEET", t, "Plan KTAS", r["Plan KTAS"]),
+                "min_rwy": _req_num("THE FLEET", t, "Min rwy", r["Min rwy"], int),
+                "home": r["Home"].strip().upper(),
+                "current": r["Current"].strip().upper(),
+                "away": _req_num("THE FLEET", t, "Away", r["Away"], int),
+            }
+            for field, ok in (("cls", CLASSES), ("ops", OPS_MODES),
+                              ("status", STATUSES)):
+                if rec[field] not in ok:
+                    raise DataError(f"THE FLEET: {t} has {field} {rec[field]!r}; "
+                                    f"expected one of {', '.join(ok)}")
+            if rec["ktas"] <= 0:
+                raise DataError(f"THE FLEET: {t} Plan KTAS must be positive")
+            self.fleet.append(rec)
+        if not self.fleet:
+            raise DataError("THE FLEET: no tails parsed")
 
         self.limits = {}
-        for r in parse_table(text, "MODEL LIMITS"):
+        num_cols = ("Seats", "BOW", "MZFW", "MTOW", "MLW", "Max fuel", "Baggage",
+                    "Plan burn", "Reserve")
+        for r in parse_table(text, "MODEL LIMITS", "Model",
+                             required=("Model", "ICAO") + num_cols):
             if not r.get("Model"):
                 continue
-            self.limits[r["Model"]] = {
-                "icao": r["ICAO"],
-                "seats": _num(r["Seats"], int, 0),
-                "bow": _num(r["BOW"]),
-                "mzfw": _num(r["MZFW"]),
-                "mtow": _num(r["MTOW"]),
-                "mlw": _num(r["MLW"]),
-                "max_fuel": _num(r["Max fuel"]),
-                "baggage": _num(r["Baggage"]),
-                "burn": _num(r["Plan burn"]),
-                "reserve": _num(r["Reserve"]),
+            mdl = r["Model"].strip()
+            v = {c: _req_num("MODEL LIMITS", mdl, c, r[c],
+                             int if c == "Seats" else float) for c in num_cols}
+            self.limits[mdl] = {
+                "icao": r["ICAO"].strip(), "seats": v["Seats"], "bow": v["BOW"],
+                "mzfw": v["MZFW"], "mtow": v["MTOW"], "mlw": v["MLW"],
+                "max_fuel": v["Max fuel"], "baggage": v["Baggage"],
+                "burn": v["Plan burn"], "reserve": v["Reserve"],
             }
+        for f in self.fleet:
+            if f["model"] not in self.limits:
+                raise DataError(f"THE FLEET: {f['tail']} model {f['model']!r} has "
+                                f"no MODEL LIMITS row")
 
         # Region table. The Scope column keeps US state codes and ISO country
         # codes in separate namespaces — they collide otherwise (CO, CA, MS...).
         self.region_by_state, self.region_by_country = {}, {}
-        for r in parse_table(text, "REGION TABLE"):
+        self.regions = set()
+        for r in parse_table(text, "REGION TABLE", "Region",
+                             required=("Region", "Scope", "Members")):
             region = r.get("Region", "").strip()
             scope = r.get("Scope", "").strip().lower()
             if not region or not r.get("Members"):
                 continue
+            if scope not in ("us_state", "country"):
+                raise DataError(f"REGION TABLE: {region} scope {scope!r}; expected "
+                                f"us_state or country")
+            self.regions.add(region)
             target = (self.region_by_state if scope == "us_state"
                       else self.region_by_country)
             for tok in r["Members"].split():
@@ -648,34 +837,52 @@ class Doc:
                 if len(tok) == 2:
                     target.setdefault(tok, region)
 
-        self.affinity = {}
-        m = re.search(r"\|\s*Class\s*\|\s*Regions\s*\|(.+?)(?=\n\s*\n|\n#{1,4}\s)",
-                      text, re.S)
-        if m:
-            for line in m.group(1).splitlines():
-                if not line.strip().startswith("|"):
-                    continue
-                cells = _split_row(line)
-                if len(cells) >= 2 and cells[0] in ("turboprop", "mid_jet", "large_jet"):
-                    self.affinity[cells[0]] = cells[1]
+        # Affinity: the regions each class does NOT score the affinity bonus
+        # for. Region `Other` never scores it. Parsed, so the table governs.
+        self.affinity_excluded = {}
+        for r in parse_table(text, "REGION TABLE", "Class",
+                             required=("Class", "Excluded regions")):
+            cls = r.get("Class", "").strip()
+            if cls not in CLASSES:
+                raise DataError(f"REGION TABLE affinity: unknown class {cls!r}")
+            raw = r.get("Excluded regions", "").strip()
+            names = ([] if raw in ("", "—", "-", "none")
+                     else [x.strip() for x in raw.split(",") if x.strip()])
+            bad = [x for x in names if x not in self.regions]
+            if bad:
+                raise DataError(f"REGION TABLE affinity: {cls} excludes unknown "
+                                f"region(s) {', '.join(bad)}")
+            self.affinity_excluded[cls] = set(names)
+        missing = [c for c in CLASSES if c not in self.affinity_excluded]
+        if missing:
+            raise DataError(f"REGION TABLE affinity: no row for {', '.join(missing)}")
 
         self.class_register = {}
-        try:
-            for r in parse_table(text, "AIRPORT CLASS REGISTER"):
-                if r.get("ICAO") and r.get("Class"):
-                    self.class_register[r["ICAO"].strip()] = r["Class"].strip().upper()
-        except KeyError:
-            pass
+        for r in parse_table(text, "AIRPORT CLASS REGISTER", "ICAO",
+                             required=("ICAO", "Class")):
+            if r.get("ICAO") and r.get("Class"):
+                self.class_register[r["ICAO"].strip().upper()] = \
+                    r["Class"].strip().upper()
 
+        # A Route that does not parse is a hard error. It used to be skipped
+        # silently: rows written `KPWK-KDAB` never matched an arrow-only
+        # pattern, so recency and region rotation read an empty logbook from
+        # about 19 SEP to 12 NOV 2026 and scored every candidate the same.
         self.logbook = []
-        for r in parse_table(text, "THE LOGBOOK"):
-            route = r.get("Route", "")
-            mm = re.search(r"([A-Z0-9]{3,4})\s*(?:→|->)\s*([A-Z0-9]{3,4})", route)
-            if not mm:
+        self.logbook_rows = 0
+        for r in parse_table(text, "THE LOGBOOK", "Date",
+                             required=("Date", "Reg", "Route", "Job type")):
+            if not any(v.strip() for v in r.values()):
                 continue
+            self.logbook_rows += 1
+            route = r.get("Route", "")
+            mm = ROUTE_RE.match(route)
+            if not mm:
+                raise DataError(f"THE LOGBOOK: unparseable Route {route!r} — "
+                                f"write it as KAAA-KBBB")
             self.logbook.append({
                 "date": r.get("Date", ""),
-                "reg": r.get("Reg", ""),
+                "reg": r.get("Reg", "").strip(),
                 "dep": mm.group(1),
                 "dest": mm.group(2),
                 "job": r.get("Job type", ""),
@@ -685,11 +892,18 @@ class Doc:
         # Newest last in the document; work newest-first internally.
         self.logbook_recent = list(reversed(self.logbook))
 
-        self.model_by_tail = {f["tail"]: f["model"] for f in self.fleet}
+    def manifest(self, airports: dict | None = None) -> str:
+        active = sum(1 for f in self.fleet if f["status"] == "active")
+        s = (f"state: {len(self.fleet)} tails ({active} active) · "
+             f"{len(self.limits)} models · {len(self.class_register)} register · "
+             f"{len(self.logbook)}/{self.logbook_rows} logbook rows")
+        if airports is not None:
+            s += f" · {len(airports):,} airports"
+        return s
 
     def limits_for(self, model: str) -> dict:
         if model not in self.limits:
-            raise KeyError(f"no MODEL LIMITS row for model: {model}")
+            raise DataError(f"no MODEL LIMITS row for model: {model}")
         return self.limits[model]
 
 
@@ -698,15 +912,35 @@ class Doc:
 # ---------------------------------------------------------------------------
 
 USABLE_TYPES = {"large_airport", "medium_airport", "small_airport", "seaplane_base"}
+AIRPORT_COLS = ("ident", "type", "name", "latitude_deg", "longitude_deg",
+                "elevation_ft", "iso_country", "iso_region", "municipality",
+                "scheduled_service", "icao_code")
+RUNWAY_COLS = ("airport_ident", "length_ft", "width_ft", "surface", "closed")
+# Floor on usable airports with a land runway. The full OurAirports set holds
+# about 49,000 usable airports; a truncated download, an HTML error page saved
+# as CSV, or a renamed column lands far below it. A trimmed test snapshot
+# passes --data-floor 0.
+DATA_FLOOR_DEFAULT = 20000
 
 
-def load_airports(data_dir: str) -> dict:
+def _check_cols(fh, path: str, need: tuple) -> csv.DictReader:
+    rd = csv.DictReader(fh)
+    have = set(rd.fieldnames or [])
+    missing = [c for c in need if c not in have]
+    if missing:
+        raise DataError(f"{path}: missing column(s) {', '.join(missing)} — "
+                        f"OurAirports schema changed or the download failed")
+    return rd
+
+
+def load_airports(data_dir: str, floor: int = DATA_FLOOR_DEFAULT) -> dict:
     runways: dict[str, int] = {}
     widths: dict[str, int] = {}
     paved: dict[str, bool] = {}
     water: set[str] = set()
-    with open(os.path.join(data_dir, "runways.csv"), encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
+    rpath = os.path.join(data_dir, "runways.csv")
+    with open(rpath, encoding="utf-8") as fh:
+        for row in _check_cols(fh, rpath, RUNWAY_COLS):
             if row.get("closed") == "1":
                 continue
             ident = row.get("airport_ident") or ""
@@ -735,8 +969,9 @@ def load_airports(data_dir: str) -> dict:
                 paved[ident] = surf == "paved"
 
     airports: dict[str, dict] = {}
-    with open(os.path.join(data_dir, "airports.csv"), encoding="utf-8") as fh:
-        for row in csv.DictReader(fh):
+    apath = os.path.join(data_dir, "airports.csv")
+    with open(apath, encoding="utf-8") as fh:
+        for row in _check_cols(fh, apath, AIRPORT_COLS):
             if row.get("type") not in USABLE_TYPES:
                 continue
             ident = row.get("ident") or ""
@@ -763,10 +998,17 @@ def load_airports(data_dir: str) -> dict:
                 "paved": paved.get(ident, False),
                 "water": ident in water or row.get("type") == "seaplane_base",
                 "elev": _num(row.get("elevation_ft", ""), float, 0.0),
+                "icao_code": (row.get("icao_code") or "").strip().upper(),
             }
-    for new, old in IDENT_ALIASES.items():
-        if new not in airports and old in airports:
+    for old in [k for k, a in airports.items()
+                if ICAO_RE.match(a["icao_code"]) and a["icao_code"] != k]:
+        new = airports[old]["icao_code"]
+        if new not in airports:
             airports[new] = dict(airports.pop(old), ident=new)
+    with_rwy = sum(1 for a in airports.values() if a["rwy"] > 0)
+    if with_rwy < floor:
+        raise DataError(f"only {with_rwy:,} airports with a land runway (floor "
+                        f"{floor:,}) — airport data truncated or malformed")
     return airports
 
 
@@ -839,19 +1081,8 @@ def fmt_hm(hours: float) -> str:
     return f"{total // 60}h {total % 60:02d}m"
 
 
-def day_part(local_hour: int) -> str:
-    for name, lo, hi in DAY_PARTS:
-        if lo < hi:
-            if lo <= local_hour < hi:
-                return name
-        else:
-            if local_hour >= lo or local_hour < hi:
-                return name
-    return "daylight"
-
-
 # ---------------------------------------------------------------------------
-# Feasibility (DISPATCH.md LOAD PLANNING STANDARDS, Section 6a)
+# Feasibility (RULES.md → LOAD PLANNING)
 # ---------------------------------------------------------------------------
 
 def feasibility(lim: dict, block_h: float) -> dict | None:
@@ -892,7 +1123,7 @@ def feasibility(lim: dict, block_h: float) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Scoring (DISPATCH.md VARIETY ENGINE)
+# Scoring (RULES.md → VARIETY ENGINE)
 # ---------------------------------------------------------------------------
 
 def build_history(doc: Doc, airports: dict) -> dict:
@@ -902,7 +1133,6 @@ def build_history(doc: Doc, airports: dict) -> dict:
     for f in recent:
         ap = airports.get(f["dest"])
         regions.append(region_of(ap, doc) if ap else "Other")
-    last_model = doc.model_by_tail.get(recent[0]["reg"]) if recent else None
     return {
         "dest_last3": set(dests[:3]),
         "dest_last10": set(dests[:10]),
@@ -910,13 +1140,11 @@ def build_history(doc: Doc, airports: dict) -> dict:
         "region_last1": regions[0] if regions else None,
         "region_last2": regions[:2],
         "region_last5": set(regions[:5]),
-        "last_model": last_model,
     }
 
 
 def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
-                    dest_region, home_ap, cur_ap, named_filter,
-                    event_dist_nm=None) -> dict:
+                    dest_region, home_ap, cur_ap, event_dist_nm=None) -> dict:
     parts = {}
 
     # Recency — fleet-wide, larger penalty only.
@@ -972,30 +1200,14 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
                 elif toward_home:
                     parts["home_pull"] = HOME_REGIONAL_TOWARD
 
-    # Aircraft-region affinity.
-    aff = doc.affinity.get(tail["cls"], "")
-    in_affinity = True
-    if tail["cls"] == "mid_jet" and dest_region == "Hawaii":
-        in_affinity = False
-    if tail["cls"] == "turboprop" and dest_region in ("Hawaii", "Other"):
-        in_affinity = False
+    # Aircraft-region affinity, from the REGION TABLE affinity rows.
     parts["affinity"] = (AFFINITY_BONUS
-                         if in_affinity and dest_region != "Other" else 0)
+                         if dest_region != "Other"
+                         and dest_region not in doc.affinity_excluded[tail["cls"]]
+                         else 0)
 
-    # Model rotation — ignored when Kyle named a tail, model, or class.
-    parts["model_rotation"] = (
-        0 if named_filter or hist["last_model"] != tail["model"]
-        else MODEL_ROTATION_PENALTY
-    )
-
-    # Event repositioning. A positioning leg into an event market is usually a
-    # short empty hop, so the fullness penalty would otherwise guarantee it
-    # never reaches a board — which is exactly backwards. The penalty is
-    # floored at zero for these. The bonus itself is 0: Dispatch selects the
-    # event card into a reserved slot, so `positioning` and `event_dist_nm`
-    # are the load-bearing output here, not the score.
-    positioning = event_dist_nm is not None
-    parts["event_positioning"] = EVENT_POSITIONING_BONUS if positioning else 0
+    # Event market. The flag is the output; nothing is scored for it.
+    in_market = event_dist_nm is not None
 
     # Destination quality — the discriminator inside a flat fullness band.
     parts["quality"] = quality_score(ap)
@@ -1003,14 +1215,13 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
     # Fullness.
     fullness = block_h / ceiling_h if ceiling_h > 0 else 0
     parts["fullness"] = fullness_score(block_h, ceiling_h)
-    if positioning:
-        # Under the v6.3 curve, flooring at zero was enough to neutralise the
-        # short-hop penalty. Under the band it is not: an in-band leg scores
-        # BAND_FULL_PTS, so a floored positioning leg would sit a full band's
-        # worth behind and never reach the reported set — the exact failure the
-        # floor exists to prevent. Positioning legs are scored as in-band, which
-        # removes the penalty without awarding anything on top.
+    # Two legs are short by nature and exempt from the band floor: an in-market
+    # leg and the tail's own home base. Both are scored as in-band. Before v7.0
+    # the home leg kept BAND_SHORT_PTS, so a based tail asked for 3.5 h ranked
+    # its own home field last of 222 — the one leg the home pull exists for.
+    if in_market or ap["ident"] == tail["home"]:
         parts["fullness"] = BAND_FULL_PTS
+    if in_market:
         parts["region"] = max(0, parts["region"])
 
     return {
@@ -1018,7 +1229,7 @@ def score_candidate(ap, tail, lim, doc, hist, block_h, ceiling_h,
         "total": round(sum(parts.values()), 1),
         "fullness_pct": round(fullness * 100),
         "toward_home": toward_home,
-        "positioning": positioning,
+        "in_market": in_market,
         "event_dist_nm": None if event_dist_nm is None else round(event_dist_nm),
     }
 
@@ -1031,7 +1242,8 @@ def print_rules() -> None:
     """Print every scoring constant. RULES.md points here instead of restating
     them, so there is exactly one place a number can be wrong."""
     w = 30
-    print("Meridian Air Dispatch — active scoring constants\n")
+    print(f"Meridian Air Dispatch — active scoring constants · script "
+          f"v{SCRIPT_VERSION} · state schema {STATE_SCHEMA}\n")
     print("Timing")
     print(f"  {'route factor':<{w}} x{ROUTE_FACTOR}")
     print(f"  {'taxi':<{w}} {TAXI_H:.2f} h")
@@ -1042,6 +1254,9 @@ def print_rules() -> None:
     print("\nLoad")
     print(f"  {'pax allowance':<{w}} {PAX_ALLOWANCE_LB} lb")
     print(f"  {'of which baggage':<{w}} {BAG_PER_PAX_LB} lb")
+    for icao in sorted(PAX_ALLOWANCE_LB_OVERRIDE):
+        print(f"  {'override ' + icao:<{w}} {PAX_ALLOWANCE_LB_OVERRIDE[icao]} lb "
+              f"({BAG_PER_PAX_LB_OVERRIDE[icao]} lb bag)")
     print("\nField quality")
     print(f"  {'minimum width':<{w}} {FIELD_MIN_WIDTH_FT} ft")
     print(f"  {'large jet on Class D needs':<{w}} {LARGE_JET_CLASS_D_MIN_RWY} ft")
@@ -1059,9 +1274,6 @@ def print_rules() -> None:
         ("home pull: regional, region", HOME_REGIONAL_REGION),
         ("home pull: regional, toward", HOME_REGIONAL_TOWARD),
         ("aircraft-region affinity", AFFINITY_BONUS),
-        ("model rotation", MODEL_ROTATION_PENALTY),
-        ("event positioning", EVENT_POSITIONING_BONUS),
-        ("verified event (by Dispatch)", EVENT_VERIFIED_BONUS),
     ):
         print(f"  {label:<{w}} {val:+d}")
     print("\nFullness band (absolute, not a fraction of the ceiling)")
@@ -1069,12 +1281,16 @@ def print_rules() -> None:
     print(f"  {'through':<{w}} ceiling +{BAND_OVER_H * 60:.0f} min")
     print(f"  {'credit inside the band':<{w}} {BAND_FULL_PTS:+.0f}")
     print(f"  {'below the floor':<{w}} not offered "
-          f"(positioning legs and home base exempt)")
+          f"(in-market legs and home base exempt, scored in-band)")
     print("\nDestination quality (airport `type` is deliberately not scored)")
     print("  runway anchors (ft -> pts)   "
           + ", ".join(f"{int(x)}:{y:+.0f}" for x, y in QUALITY_RWY_ANCHORS))
     print(f"  {'scheduled service':<{w}} {QUALITY_SCHEDULED:+.0f}")
-    print(f"\nEvent market radius            {EVENT_RADIUS_NM} nm")
+    print(f"\nEvent market radius            {EVENT_RADIUS_NM} nm (flag only, "
+          f"no score)")
+    print(f"Sun window                     ±{SUN_WINDOW_MIN} min of sunrise/sunset")
+    print(f"Candidates per tail (--top)    {TOP_DEFAULT} default, {TOP_MAX} max")
+    print(f"Default --date                 today in {HOME_TZ}")
 
 
 def main() -> int:
@@ -1083,30 +1299,34 @@ def main() -> int:
         return 0
 
     ap_arg = argparse.ArgumentParser(
-        description="Meridian Air Dispatch candidate math (RULES.md v6.8)")
+        description=f"Meridian Air Dispatch candidate math (script "
+                    f"v{SCRIPT_VERSION}, RULES.md v{SCRIPT_VERSION})")
     ap_arg.add_argument("--rules", action="store_true",
                         help="print the active scoring constants and exit")
     ap_arg.add_argument("--hours", type=float,
-                        help="stated availability in hours (required except "
-                             "with --finalize)")
+                        help="stated availability in hours (always required)")
     ap_arg.add_argument("--include-stored", action="store_true",
                         help="include tails marked stored in THE FLEET")
     ap_arg.add_argument("--tail", help="restrict to one tail, e.g. N100PE")
     ap_arg.add_argument("--model", help='restrict to one model, e.g. "Citation X"')
     ap_arg.add_argument("--class", dest="cls",
                         choices=["turboprop", "mid_jet", "large_jet"])
-    ap_arg.add_argument("--date", help="flight date DDMMMYY (default: today UTC)")
-    ap_arg.add_argument("--depz", default="1500",
-                        help="assumed Zulu departure HHMM for day-part and URL")
+    ap_arg.add_argument("--date", help=f"flight date DDMMMYY (default: today in "
+                                         f"{HOME_TZ})")
+    ap_arg.add_argument("--expect", metavar="VERSION",
+                        help="RULES.md version this session loaded; exit 5 if "
+                             "it differs from the script's")
+    ap_arg.add_argument("--data-floor", type=int, default=DATA_FLOOR_DEFAULT,
+                        help="minimum airports with a land runway before the "
+                             "data is treated as truncated (tests use 0)")
     ap_arg.add_argument("--doc", default="dispatch_state.md",
                         help="state file holding THE FLEET, MODEL LIMITS, "
                              "REGION TABLE, AIRPORT CLASS REGISTER and THE "
                              "LOGBOOK (default: dispatch_state.md)")
     ap_arg.add_argument("--data", default="data", help="OurAirports CSV directory")
     ap_arg.add_argument("--top", type=int, default=None,
-                        help="candidates reported per tail (default: 12 when a "
-                             "tail, model, or class is named; 6 for a "
-                             "full-fleet run)")
+                        help=f"candidates reported per tail (default "
+                             f"{TOP_DEFAULT}, max {TOP_MAX})")
     ap_arg.add_argument("--allow-b", action="store_true",
                         help="permit destinations VERIFIED as Class B in the "
                              "register. Note this does not gate unverified "
@@ -1123,19 +1343,19 @@ def main() -> int:
                              "aircraft on a rough strip")
     ap_arg.add_argument("--event", action="append", default=[], metavar="ICAO",
                         help="airport of a verified event market; repeatable. "
-                             "Candidates at or near it score an event "
-                             "positioning bonus and are exempt from the "
-                             "fullness penalty (empty ferry legs are short)")
+                             "Destinations within --event-radius are flagged "
+                             "in_market (EV<nm> in the table) and exempt from "
+                             "the fullness floor. Nothing is added to the score")
     ap_arg.add_argument("--event-radius", type=float, default=EVENT_RADIUS_NM,
                         help=f"nm around each --event airport (default "
                              f"{EVENT_RADIUS_NM})")
     ap_arg.add_argument("--event-phase", choices=["inbound", "outbound"],
                         default="inbound",
-                        help="inbound: bonus for flying INTO the event market "
-                             "(empty positioning). outbound: the tail is "
-                             "already in the market and departures may carry "
-                             "the event tie — no geographic bonus applies, "
-                             "because every departure is equally event-tied")
+                        help="inbound: flag destinations inside the event "
+                             "market. outbound: the tail is already in the "
+                             "market, so every departure may carry the event "
+                             "tie (event_tie_available) and no destination is "
+                             "flagged")
     ap_arg.add_argument("--json", action="store_true")
     ap_arg.add_argument("--table", action="store_true",
                         help="print the step-6 decision table with each "
@@ -1146,19 +1366,32 @@ def main() -> int:
                         help="compute card fields and finished SimBrief URLs "
                              "for the story picks in PICKS (a JSON file)")
     args = ap_arg.parse_args()
-    if args.hours is None and not args.finalize:
-        ap_arg.error("--hours is required unless --finalize is given")
+    if args.expect and args.expect.lstrip("v") != SCRIPT_VERSION:
+        print(f"version mismatch: RULES {args.expect}, script {SCRIPT_VERSION} — "
+              f"fetch the matching script or reload RULES.md", file=sys.stderr)
+        return 5
+    if args.hours is None:
+        ap_arg.error("--hours is required")
+    if args.top is not None and not 1 <= args.top <= TOP_MAX:
+        ap_arg.error(f"--top must be between 1 and {TOP_MAX}")
 
     try:
         doc = Doc(args.doc)
-    except (OSError, KeyError) as exc:
+    except (OSError, DataError) as exc:
         print(f"error reading {args.doc}: {exc}", file=sys.stderr)
         return 3
     try:
-        airports = load_airports(args.data)
-    except OSError as exc:
+        airports = load_airports(args.data, args.data_floor)
+    except (OSError, DataError) as exc:
         print(f"error reading airport data: {exc}", file=sys.stderr)
         return 3
+    for f in doc.fleet:
+        for col in ("home", "current"):
+            if f[col] not in airports and f["status"] == "active":
+                print(f"error: THE FLEET {f['tail']} {col} {f[col]} is not in the "
+                      f"airport database", file=sys.stderr)
+                return 3
+    manifest = doc.manifest(airports)
 
     if args.finalize:
         try:
@@ -1166,7 +1399,7 @@ def main() -> int:
             tf_f = TimezoneFinder()
         except ImportError:
             tf_f = None
-        return finalize(args, doc, airports, tf_f)
+        return finalize(args, doc, airports, tf_f, manifest)
 
     ceiling = args.hours - CEILING_MARGIN_H
     if ceiling <= 0:
@@ -1177,29 +1410,28 @@ def main() -> int:
     pool = doc.fleet
     if not args.include_stored:
         pool = [f for f in pool if f["status"] != "stored"]
-    named = False
-    top_default_named, top_default_fleet = 12, 6
     if args.tail:
         pool = [f for f in pool if f["tail"].upper() == args.tail.upper()]
-        named = True
     elif args.model:
         pool = [f for f in pool if f["model"].lower() == args.model.lower()]
-        named = True
     elif args.cls:
         pool = [f for f in pool if f["cls"] == args.cls]
-        named = True
     if not pool:
         print("no tails match that filter", file=sys.stderr)
         return 2
     if args.top is None:
-        args.top = top_default_named if named else top_default_fleet
+        args.top = TOP_DEFAULT
 
-    flight_date = (datetime.strptime(args.date, "%d%b%y")
-                   if args.date else datetime.now(timezone.utc))
+    try:
+        flight_date = (datetime.strptime(args.date, "%d%b%y")
+                       if args.date else datetime.now(ZoneInfo(HOME_TZ)))
+    except ValueError:
+        ap_arg.error(f"--date must be DDMMMYY, got {args.date!r}")
     date_ddmmmyy = flight_date.strftime("%d%b%y").upper()
-    deph, depm = args.depz[:2], args.depz[2:4]
-    dep_dt_utc = datetime(flight_date.year, flight_date.month, flight_date.day,
-                          int(deph), int(depm), tzinfo=timezone.utc)
+    # Noon UTC on the flight date: only used to pick the local date for the
+    # table's sun times. Card times come from --finalize.
+    sun_ref = datetime(flight_date.year, flight_date.month, flight_date.day, 12,
+                       tzinfo=timezone.utc)
 
     try:
         from timezonefinder import TimezoneFinder
@@ -1227,20 +1459,10 @@ def main() -> int:
             continue
         try:
             lim = doc.limits_for(tail["model"])
-        except KeyError as exc:
+        except DataError as exc:
             notes.append(str(exc))
             continue
 
-        local_hour, local_str = int(deph), f"{deph}:{depm}Z"
-        if tf:
-            tzname = tf.timezone_at(lat=cur["lat"], lng=cur["lon"])
-            if tzname:
-                loc = dep_dt_utc.astimezone(ZoneInfo(tzname))
-                local_hour = loc.hour
-                local_str = loc.strftime("%H:%M")
-        part = day_part(local_hour)
-
-        amphib_water_only = tail["tail"] == "N828DC" and not args.land
         cands = []
 
         # Outbound phase: the bonus is temporal, not geographic. If the tail is
@@ -1262,27 +1484,12 @@ def main() -> int:
             if ident == tail["current"]:
                 continue
 
-            if amphib_water_only:
-                if not a["water"]:
-                    continue
-            else:
-                if a["type"] == "seaplane_base":
-                    continue
-                if a["rwy"] < tail["min_rwy"]:
-                    continue
-                if (not args.allow_small_fields
-                        and not field_quality_ok(a)
-                        and ident != tail["home"]):
-                    continue
-
-            is_home = ident == tail["home"]
-            eff = doc.class_register.get(ident, proxy_class(a))
-            if not is_home and not amphib_water_only:
-                # A tail's home base is always a legal destination regardless of tier.
-                if eff == "B" and not args.allow_b:
-                    continue
-                if not tier_ok(a, eff, tail["cls"], args.allow_b):
-                    continue
+            # The shared legality gate (also run by --finalize). A tail's home
+            # base is legal regardless of tier and field quality.
+            gate, eff, class_b = destination_gate(
+                a, tail, doc, allow_small=args.allow_small_fields, land=args.land)
+            if gate or (class_b and not args.allow_b):
+                continue
 
             gc = gc_nm(cur["lat"], cur["lon"], a["lat"], a["lon"])
             if gc < 1:
@@ -1317,7 +1524,7 @@ def main() -> int:
 
             dest_region = region_of(a, doc)
             sc = score_candidate(a, tail, lim, doc, hist, block, ceiling,
-                                 dest_region, home, cur, named, ev_dist)
+                                 dest_region, home, cur, ev_dist)
 
             cands.append({
                 "tail": tail["tail"],
@@ -1326,6 +1533,7 @@ def main() -> int:
                 "class": tail["cls"],
                 "dep": tail["current"],
                 "dep_city": cur["muni"],
+                "home": tail["home"],
                 "dest": ident,
                 "dest_name": a["name"],
                 "dest_city": a["muni"],
@@ -1342,21 +1550,15 @@ def main() -> int:
                 "session": fmt_hm(block + PREP_H),
                 "fullness_pct": sc["fullness_pct"],
                 "toward_home": sc["toward_home"],
-                "positioning": sc["positioning"],
+                "in_market": sc["in_market"],
                 "event_tie_available": event_tie_available,
                 "event_dist_nm": sc["event_dist_nm"],
                 "ops": tail["ops"],
                 "home_pull_active": (tail["ops"] != "floating"
                                      and tail["current"] != tail["home"]),
-                "day_part": part,
-                "dep_local": local_str,
-                "dep_zulu": f"{deph}{depm}Z",
                 "score": sc["total"],
                 "score_parts": sc["parts"],
                 **feas,
-                "simbrief": SIMBRIEF_URL.format(
-                    type=tail["icao"], orig=tail["current"], dest=ident,
-                    reg=tail["tail"], date=date_ddmmmyy, deph=deph, depm=depm),
             })
 
         if not cands and tail["current"] == tail["home"]:
@@ -1401,6 +1603,7 @@ def main() -> int:
                     "icao_type": tail["icao"], "class": tail["cls"],
                     "ops": tail["ops"], "fallback": True,
                     "dep": tail["current"], "dep_city": cur["muni"],
+                    "home": tail["home"],
                     "dest": ident, "dest_name": a["name"],
                     "dest_city": a["muni"], "dest_region": region_of(a, doc),
                     "dest_class": doc.class_register.get(ident, proxy_class(a)),
@@ -1411,30 +1614,24 @@ def main() -> int:
                     "block_h": round(block, 3), "block": fmt_hm(block),
                     "session": fmt_hm(block + PREP_H),
                     "fullness_pct": round(block / ceiling * 100),
-                    "toward_home": True, "positioning": False,
+                    "toward_home": True, "in_market": False,
                     "event_tie_available": False, "event_dist_nm": None,
                     "home_pull_active": True,
-                    "day_part": part, "dep_local": local_str,
-                    "dep_zulu": f"{deph}{depm}Z",
                     "score": 0, "score_parts": {"fallback_ferry": 0}, **feas,
-                    "simbrief": SIMBRIEF_URL.format(
-                        type=tail["icao"], orig=tail["current"], dest=ident,
-                        reg=tail["tail"], date=date_ddmmmyy,
-                        deph=deph, depm=depm),
                 })
                 notes.append(
                     f"{tail['tail']}: no scoring candidates from "
                     f"{tail['current']} — offering a ferry leg toward "
                     f"{tail['home']} instead")
 
-        # Tie-break: score, then better-equipped field, then positioning legs
-        # ahead of ordinary ones, then nearest-to-event for positioning and
+        # Tie-break: score, then better-equipped field, then in-market legs
+        # ahead of ordinary ones, then nearest-to-event for in-market and
         # longest-leg for everything else.
         def _key(c):
             return (-c["score"],
                     -TYPE_RANK.get(c["dest_type"], 0),
-                    0 if c["positioning"] else 1,
-                    c["event_dist_nm"] if c["positioning"] else -c["gc_nm"])
+                    0 if c["in_market"] else 1,
+                    c["event_dist_nm"] if c["in_market"] else -c["gc_nm"])
 
         cands.sort(key=_key)
         # Spread the reported set across regions rather than returning twelve
@@ -1455,6 +1652,15 @@ def main() -> int:
                 if len(picked) >= args.top:
                     break
             picked.sort(key=_key)
+        # A tail away from home always sees its home leg, whatever it scores,
+        # so the board can send it home without a second run.
+        if tail["current"] != tail["home"]:
+            home_c = next((c for c in cands if c["dest"] == tail["home"]), None)
+            if home_c is not None and home_c not in picked:
+                if len(picked) >= args.top:
+                    picked.pop()
+                picked.append(home_c)
+                picked.sort(key=_key)
         results.extend(picked)
 
     if not results:
@@ -1463,14 +1669,15 @@ def main() -> int:
             print(f"  note: {n}", file=sys.stderr)
         return 2
 
-    payload = {"ceiling_h": ceiling, "date": date_ddmmmyy,
+    payload = {"version": SCRIPT_VERSION, "manifest": manifest,
+               "ceiling_h": ceiling, "date": date_ddmmmyy,
                "notes": notes, "candidates": results}
     if args.json_out:
         with open(args.json_out, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
     if args.table:
         print_table(results, notes, ceiling, date_ddmmmyy, airports, tf,
-                    dep_dt_utc)
+                    sun_ref, manifest)
         return 0
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -1478,7 +1685,8 @@ def main() -> int:
 
     print(f"Block ceiling {fmt_hm(ceiling)} "
           f"(availability {fmt_hm(args.hours)} − 30 min) · "
-          f"date {date_ddmmmyy} · assumed departure {deph}{depm}Z")
+          f"date {date_ddmmmyy}")
+    print(manifest)
     for n in notes:
         print(f"note: {n}")
 
@@ -1489,8 +1697,7 @@ def main() -> int:
     for tail_id, cands in by_tail.items():
         t = cands[0]
         print(f"\n{tail_id} · {t['model']} ({t['icao_type']}) · from {t['dep']} "
-              f"{t['dep_city']} · {t['dep_local']} local, {t['day_part']} · "
-              f"ops {t['ops']}"
+              f"{t['dep_city']} · ops {t['ops']}"
               + ("  [home pull active]" if t["home_pull_active"] else "")
               + ("  [FALLBACK FERRY — no scoring candidates]"
                  if t.get("fallback") else ""))
@@ -1505,8 +1712,8 @@ def main() -> int:
                   f"{c['score']:>7g}")
             bits = " ".join(f"{k}{v:+g}" for k, v in c["score_parts"].items() if v)
             extra = " toward-home" if c["toward_home"] else ""
-            if c["positioning"]:
-                extra += (" POSITIONING-ferry"
+            if c["in_market"]:
+                extra += (" IN-MARKET"
                           + (f" ({c['event_dist_nm']} nm from event market)"
                              if c["event_dist_nm"] else " (in event market)"))
             print(f"      {bits}{extra} · fuel {c['fuel_plan']} lb · "
