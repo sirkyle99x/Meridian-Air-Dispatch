@@ -1,0 +1,4 @@
+# Pinned so a test run and a dispatch session compute identical time zones and
+# sun times. RULES.md step 4 installs these same versions.
+timezonefinder==9.2.0
+astral==3.2

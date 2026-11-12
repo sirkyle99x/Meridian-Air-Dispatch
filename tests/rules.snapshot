@@ -1,0 +1,47 @@
+Meridian Air Dispatch — active scoring constants · script v7.0 · state schema 6.2
+
+Timing
+  route factor                   x1.07
+  taxi                           0.25 h
+  prep (session time only)       0.35 h
+  ceiling margin                 0.50 h
+  overhead anchors (nm -> h)   50:0.26, 175:0.26, 375:0.26, 600:0.26
+
+Load
+  pax allowance                  230 lb
+  of which baggage               55 lb
+  override FA50                  235 lb (35 lb bag)
+  override H25B                  195 lb (25 lb bag)
+
+Field quality
+  minimum width                  75 ft
+  large jet on Class D needs     7000 ft
+
+Scoring
+  recency: in last 3             -50
+  recency: in last 10            -20
+  recency: never flown           +10
+  region: both of last 2         -30
+  region: last 1 only            -15
+  region: absent from last 5     +20
+  home pull: based, home         +35
+  home pull: based, toward       +20
+  home pull: regional, home      +30
+  home pull: regional, region    +25
+  home pull: regional, toward    +10
+  aircraft-region affinity       +10
+
+Fullness band (absolute, not a fraction of the ceiling)
+  full credit from               ceiling -15 min
+  through                        ceiling +5 min
+  credit inside the band         +20
+  below the floor                not offered (in-market legs and home base exempt, scored in-band)
+
+Destination quality (airport `type` is deliberately not scored)
+  runway anchors (ft -> pts)   5000:+0, 6500:+5, 8000:+8, 10000:+10
+  scheduled service              +4
+
+Event market radius            50 nm (flag only, no score)
+Sun window                     ±45 min of sunrise/sunset
+Candidates per tail (--top)    12 default, 30 max
+Default --date                 today in America/New_York

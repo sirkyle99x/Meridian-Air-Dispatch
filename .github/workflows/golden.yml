@@ -1,0 +1,33 @@
+name: golden tests
+
+# Runs the frozen golden tests (tests/run_golden.py) on every push and pull
+# request. Green means the script still produces the 12 NOV 2026 baseline on
+# frozen inputs; red means behaviour changed, which must be either a bug or a
+# deliberate re-baseline (ARCHIVE.md → CHANGE CONTROL).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  golden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install pinned packages
+        run: pip install -r tests/requirements.txt
+      - name: Fetch frozen OurAirports snapshot
+        run: bash tests/fetch_data.sh
+      - name: Version strings agree
+        run: |
+          python3 dispatch_calc.py --rules > rules.out
+          v=$(grep -m1 -o 'script v[0-9.]*' rules.out | cut -c9-)
+          s=$(grep -m1 -o 'Schema v[0-9.]*' tests/fixtures/dispatch_state.md | cut -c9-)
+          echo "script $v · fixture schema $s"
+          grep -q "STATE_SCHEMA = \"$s\"" dispatch_calc.py
+      - name: Golden tests
+        run: python3 tests/run_golden.py
