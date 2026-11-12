@@ -337,6 +337,39 @@ check("G23", "unregistered US large_airport (KAUS, KELP) proxies C; register B s
       dc.proxy_class(aps["KAUS"]) == "C" and dc.proxy_class(aps["KELP"]) == "C"
       and doc.class_register.get("KATL") == "B")
 
+# ---- v7.2 (Phase 4) -------------------------------------------------------
+
+# G24 the staged state file stays small
+size = os.path.getsize(STATE)
+check("G24", "staged dispatch_state.md under 4 KB", size < 4096, f"{size} bytes")
+
+# G25 reference handshake
+REF = os.path.join(ROOT, "reference.md")
+bad_ref = os.path.join(TMP, "ref.md")
+with open(REF, encoding="utf-8") as fh, open(bad_ref, "w", encoding="utf-8") as out:
+    out.write(fh.read().replace("Reference v", "Reference v0.", 1))
+rc, _, err = run("--tail", "N13SY", "--hours", "2.5", "--ref", bad_ref)
+check("G25", "reference.md from another version → exit 3 naming it",
+      rc == 3 and "reference schema" in err, err.strip()[:160])
+
+# G26 tail notes reach the table
+rc, out, _ = run("--tail", "N707BM", "--hours", "2.5", "--date", "12NOV26", "--table")
+check("G26", "22 tail notes parsed; N707BM's prints under its tail",
+      len(doc.tail_notes) == 22 and rc == 0
+      and "note: Hawker 800XP. Mountain West" in out, f"{len(doc.tail_notes)} notes")
+
+# G27 run counter
+cnt_dir = os.path.join(TMP, "cnt")
+os.makedirs(cnt_dir)
+outs = []
+for _ in range(2):
+    p_ = subprocess.run([sys.executable, SCRIPT, "--doc", STATE, "--data", DATA,
+                         "--tail", "N13SY", "--hours", "2.5", "--date", "12NOV26",
+                         "--table"], capture_output=True, text=True, cwd=cnt_dir)
+    outs.append(p_.stdout.splitlines()[0] if p_.stdout else "")
+check("G27", "run counter counts runs per working directory",
+      outs[0].endswith("run 1") and outs[1].endswith("run 2"), " | ".join(outs))
+
 failed = [g for g, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed"
       + (f" · failed: {', '.join(failed)}" if failed else ""))

@@ -1,3 +1,4 @@
 tests/data/
 __pycache__/
 rules.out
+.dispatch_runs

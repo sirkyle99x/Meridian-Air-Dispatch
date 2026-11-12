@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.1).
+dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.2).
 
 Reads dispatch_state.md for state: THE FLEET, MODEL LIMITS, REGION TABLE,
 AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the single source of truth
@@ -40,8 +40,8 @@ time, event verification, and board composition.
 
 Usage
 -----
-  python3 dispatch_calc.py --expect 7.1 --hours 2.5 --tail N24SM --table --json-out cands.json
-  python3 dispatch_calc.py --expect 7.1 --finalize picks.json --hours 2.5
+  python3 dispatch_calc.py --expect 7.2 --hours 2.5 --tail N24SM --table --json-out cands.json
+  python3 dispatch_calc.py --expect 7.2 --finalize picks.json --hours 2.5
 
 picks.json is a list of objects:
   {"tail": "N24SM", "dest": "KAEX", "dep_local": "18:05",
@@ -70,8 +70,12 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-SCRIPT_VERSION = "7.1"       # must equal the RULES.md version; see --expect
-STATE_SCHEMA = "6.3"         # must equal dispatch_state.md's "Schema v" header
+SCRIPT_VERSION = "7.2"       # must equal the RULES.md version; see --expect
+STATE_SCHEMA = "6.4"         # must equal dispatch_state.md's "Schema v" header
+REF_SCHEMA = "1.0"           # must equal reference.md's "Reference v" header
+REF_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "reference.md")
+RUN_COUNTER = ".dispatch_runs"  # per-working-directory run count (C6)
 HOME_TZ = "America/New_York" # Kyle's zone: the default --date is his local date
 
 
@@ -676,6 +680,8 @@ def print_table(results, notes, ceiling, date_ddmmmyy, airports, tf, flight_date
         print(f"\n{tail_id} {t['icao_type']} · {t['ops']} · at {dep} {t['dep_city']}"
               + (" · home pull" if t["home_pull_active"] else "")
               + f" · {sun_cache[dep]}")
+        if t.get("tail_note"):
+            print(f"  note: {t['tail_note']}")
         print(f"  {'DEST':<5} {'CITY':<18} {'REGION':<20} {'CL':<3} {'RWY':>6} "
               f"{'TYPE':<6} {'Q':>4} {'FULL':>5} {'BLOCK':>7} {'SESS':>7} "
               f"{'PAX':>3} {'CGO':>5} {'SCORE':>6} FLAGS")
@@ -728,7 +734,7 @@ def parse_table(text: str, header: str, first_col: str | None = None,
     pat = re.compile(r"^#{1,4}\s+" + re.escape(header) + r"\s*$", re.M)
     m = pat.search(text)
     if not m:
-        raise DataError(f"section not found in state file: {header}")
+        raise DataError(f"section not found: {header}")
     rest = text[m.end():]
     stop = re.search(r"^#{1,4}\s+\S", rest, re.M)
     if stop:
@@ -795,10 +801,29 @@ def _req_num(table: str, key: str, field: str, v: str, cast=float):
 
 
 class Doc:
-    def __init__(self, path: str):
+    """State plus reference.
+
+    v7.2 split the old state file in two. `dispatch_state.md` (the project
+    doc, staged every session) holds only what a flight changes: THE FLEET and
+    THE LOGBOOK. `reference.md` (in the repo, fetched beside this script at the
+    same tag) holds what rarely changes: MODEL LIMITS, REGION TABLE, AIRPORT
+    CLASS REGISTER, PREFERRED FIELDS and TAIL NOTES. Each carries its own
+    schema header and is checked against this script.
+    """
+
+    def __init__(self, path: str, ref_path: str | None = None):
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-        self.path = path
+        ref_path = ref_path or REF_DEFAULT
+        with open(ref_path, encoding="utf-8") as fh:
+            ref = fh.read()
+        self.path, self.ref_path = path, ref_path
+        m = re.search(r"Reference v([\d.]+)", ref)
+        self.ref_schema = m.group(1) if m else None
+        if self.ref_schema != REF_SCHEMA:
+            raise DataError(f"reference schema {self.ref_schema or '(none)'} != "
+                            f"{REF_SCHEMA} expected by script v{SCRIPT_VERSION} — "
+                            f"fetch reference.md from the same tag as the script")
 
         # Schema handshake. The script parses this file by section name and
         # column name; a state file from another schema fails here, by name,
@@ -843,7 +868,7 @@ class Doc:
         self.limits = {}
         num_cols = ("Seats", "BOW", "MZFW", "MTOW", "MLW", "Max fuel", "Baggage",
                     "Plan burn", "Reserve")
-        for r in parse_table(text, "MODEL LIMITS", "Model",
+        for r in parse_table(ref, "MODEL LIMITS", "Model",
                              required=("Model", "ICAO", "Max GC") + num_cols):
             if not r.get("Model"):
                 continue
@@ -868,7 +893,7 @@ class Doc:
         # codes in separate namespaces — they collide otherwise (CO, CA, MS...).
         self.region_by_state, self.region_by_country = {}, {}
         self.regions = set()
-        for r in parse_table(text, "REGION TABLE", "Region",
+        for r in parse_table(ref, "REGION TABLE", "Region",
                              required=("Region", "Scope", "Members")):
             region = r.get("Region", "").strip()
             scope = r.get("Scope", "").strip().lower()
@@ -888,7 +913,7 @@ class Doc:
         # Affinity: the regions each class does NOT score the affinity bonus
         # for. Region `Other` never scores it. Parsed, so the table governs.
         self.affinity_excluded = {}
-        for r in parse_table(text, "REGION TABLE", "Class",
+        for r in parse_table(ref, "REGION TABLE", "Class",
                              required=("Class", "Excluded regions")):
             cls = r.get("Class", "").strip()
             if cls not in CLASSES:
@@ -906,7 +931,7 @@ class Doc:
             raise DataError(f"REGION TABLE affinity: no row for {', '.join(missing)}")
 
         self.class_register = {}
-        for r in parse_table(text, "AIRPORT CLASS REGISTER", "ICAO",
+        for r in parse_table(ref, "AIRPORT CLASS REGISTER", "ICAO",
                              required=("ICAO", "Class")):
             if r.get("ICAO") and r.get("Class"):
                 self.class_register[r["ICAO"].strip().upper()] = \
@@ -915,7 +940,7 @@ class Doc:
         # Kyle's preferred destinations: score the quality cap, and override
         # the military exclusion. Unknown idents are checked in preflight.
         self.preferred = {}
-        for r in parse_table(text, "PREFERRED FIELDS", "ICAO",
+        for r in parse_table(ref, "PREFERRED FIELDS", "ICAO",
                              required=("ICAO", "Note")):
             icao = r.get("ICAO", "").strip().upper()
             if icao:
@@ -950,6 +975,17 @@ class Doc:
             })
         # Newest last in the document; work newest-first internally.
         self.logbook_recent = list(reversed(self.logbook))
+
+        # Tail notes: story material for RULE 5, printed under each tail in
+        # the board table so a session never opens another document for them.
+        self.tail_notes = {}
+        sec = re.search(r"^###\s+TAIL NOTES\s*$(.*?)(?=^#{1,3}\s|\Z)", ref,
+                        re.M | re.S)
+        if not sec:
+            raise DataError("reference: section not found: TAIL NOTES")
+        for m in re.finditer(r"^- \*\*(\w+)\*\* — (.*?)(?=^- \*\*|\Z)",
+                             sec.group(1), re.M | re.S):
+            self.tail_notes[m.group(1)] = " ".join(m.group(2).split())
 
     def manifest(self, airports: dict | None = None) -> str:
         active = sum(1 for f in self.fleet if f["status"] == "active")
@@ -1387,9 +1423,12 @@ def main() -> int:
                         help="minimum airports with a land runway before the "
                              "data is treated as truncated (tests use 0)")
     ap_arg.add_argument("--doc", default="dispatch_state.md",
-                        help="state file holding THE FLEET, MODEL LIMITS, "
-                             "REGION TABLE, AIRPORT CLASS REGISTER and THE "
-                             "LOGBOOK (default: dispatch_state.md)")
+                        help="state file: THE FLEET and THE LOGBOOK "
+                             "(default: dispatch_state.md)")
+    ap_arg.add_argument("--ref", default=None,
+                        help="reference file: MODEL LIMITS, REGION TABLE, "
+                             "AIRPORT CLASS REGISTER, PREFERRED FIELDS, TAIL "
+                             "NOTES (default: reference.md beside the script)")
     ap_arg.add_argument("--data", default="data", help="OurAirports CSV directory")
     ap_arg.add_argument("--top", type=int, default=None,
                         help=f"candidates reported per tail (default "
@@ -1443,9 +1482,9 @@ def main() -> int:
         ap_arg.error(f"--top must be between 1 and {TOP_MAX}")
 
     try:
-        doc = Doc(args.doc)
+        doc = Doc(args.doc, args.ref)
     except (OSError, DataError) as exc:
-        print(f"error reading {args.doc}: {exc}", file=sys.stderr)
+        print(f"error reading state/reference: {exc}", file=sys.stderr)
         return 3
     try:
         airports = load_airports(args.data, args.data_floor)
@@ -1464,6 +1503,20 @@ def main() -> int:
               f"airport database", file=sys.stderr)
         return 3
     manifest = doc.manifest(airports)
+    # Run counter (C6). Counts script runs in this working directory, so a
+    # session can see at a glance whether it is inside the two-run board budget
+    # (one candidate run, one --event re-run) plus one finalize.
+    try:
+        with open(RUN_COUNTER, encoding="utf-8") as fh:
+            run_no = int(fh.read().strip() or 0) + 1
+    except (OSError, ValueError):
+        run_no = 1
+    try:
+        with open(RUN_COUNTER, "w", encoding="utf-8") as fh:
+            fh.write(str(run_no))
+    except OSError:
+        pass
+    manifest += f" · run {run_no}"
 
     if args.finalize:
         try:
@@ -1633,6 +1686,7 @@ def main() -> int:
                 "event_tie_available": event_tie_available,
                 "event_dist_nm": sc["event_dist_nm"],
                 "ops": tail["ops"],
+                "tail_note": doc.tail_notes.get(tail["tail"], ""),
                 "home_pull_active": (tail["ops"] != "floating"
                                      and tail["current"] != tail["home"]),
                 "score": sc["total"],
@@ -1681,6 +1735,7 @@ def main() -> int:
                     "tail": tail["tail"], "model": tail["model"],
                     "icao_type": tail["icao"], "class": tail["cls"],
                     "ops": tail["ops"], "fallback": True,
+                    "tail_note": doc.tail_notes.get(tail["tail"], ""),
                     "dep": tail["current"], "dep_city": cur["muni"],
                     "home": tail["home"],
                     "dest": ident, "dest_name": a["name"],

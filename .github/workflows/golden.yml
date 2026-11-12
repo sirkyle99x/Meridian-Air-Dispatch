@@ -29,5 +29,8 @@ jobs:
           s=$(grep -m1 -o 'Schema v[0-9.]*' tests/fixtures/dispatch_state.md | cut -c9-)
           echo "script $v · fixture schema $s"
           grep -q "STATE_SCHEMA = \"$s\"" dispatch_calc.py
+          r=$(grep -m1 -o 'Reference v[0-9.]*' reference.md | cut -c12-)
+          echo "reference schema $r"
+          grep -q "REF_SCHEMA = \"$r\"" dispatch_calc.py
       - name: Golden tests
         run: python3 tests/run_golden.py
