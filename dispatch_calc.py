@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.2).
+dispatch_calc.py — Meridian Air Dispatch candidate math (RULES.md v7.3).
 
 Reads dispatch_state.md for state: THE FLEET, MODEL LIMITS, REGION TABLE,
 AIRPORT CLASS REGISTER, THE LOGBOOK. This file is the single source of truth
@@ -40,8 +40,8 @@ time, event verification, and board composition.
 
 Usage
 -----
-  python3 dispatch_calc.py --expect 7.2 --hours 2.5 --tail N24SM --table --json-out cands.json
-  python3 dispatch_calc.py --expect 7.2 --finalize picks.json --hours 2.5
+  python3 dispatch_calc.py --expect 7.3 --hours 2.5 --tail N24SM --table --json-out cands.json
+  python3 dispatch_calc.py --expect 7.3 --finalize picks.json --hours 2.5
 
 picks.json is a list of objects:
   {"tail": "N24SM", "dest": "KAEX", "dep_local": "18:05",
@@ -62,6 +62,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
+from decimal import Decimal, ROUND_HALF_UP
 import json
 import math
 import os
@@ -70,7 +72,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-SCRIPT_VERSION = "7.2"       # must equal the RULES.md version; see --expect
+SCRIPT_VERSION = "7.3"       # must equal the RULES.md version; see --expect
 STATE_SCHEMA = "6.4"         # must equal dispatch_state.md's "Schema v" header
 REF_SCHEMA = "1.0"           # must equal reference.md's "Reference v" header
 REF_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -538,6 +540,8 @@ def finalize(args, doc, airports, tf, manifest: str) -> int:
         block = route / tail["ktas"] + overhead_h(gc) + TAXI_H
         pax = _int_field(p, "pax", problems)
         cargo = _int_field(p, "cargo", problems)
+        if args.widget:
+            problems.extend(story_problems(p, pax, cargo))
 
         in_market = None
         for ea in event_pts:
@@ -631,6 +635,9 @@ def finalize(args, doc, airports, tf, manifest: str) -> int:
             "day_part": part, "sun_edge": part in ("sunrise", "sunset"),
             "icon": DAY_PART_ICON[part],
             "simbrief": url, "problems": problems,
+            "job": str(p.get("job", "")).strip(),
+            "event": str(p.get("event") or "").strip(),
+            "hook": " ".join(str(p.get("hook", "")).split()),
         })
 
     good = [r for r in out if "day_part" in r]
@@ -643,6 +650,19 @@ def finalize(args, doc, airports, tf, manifest: str) -> int:
                 notes.append(f"{c} cards in the {part} day-part; the cap is 2")
         if len(good) > 1 and not any(r["sun_edge"] for r in good):
             notes.append("no sun-edge card on this board")
+    if args.widget:
+        # The board is rendered by the session verbatim. Card fields are
+        # repeated in the widget, so the JSON stays compact here.
+        slim = [{k: r.get(k) for k in ("pick", "tail", "dest", "departure",
+                                       "zulu_date", "day_part", "block",
+                                       "session", "problems")} for r in out]
+        print(json.dumps({"version": SCRIPT_VERSION, "manifest": manifest,
+                          "notes": notes, "picks": slim}, indent=1,
+                         ensure_ascii=False))
+        if not failed:
+            print(WIDGET_MARK)
+            print(board_html(out, args.calls))
+        return 4 if failed else 0
     print(json.dumps({"version": SCRIPT_VERSION, "manifest": manifest,
                       "notes": notes, "picks": out}, indent=2))
     return 4 if failed else 0
@@ -1392,8 +1412,367 @@ def print_rules() -> None:
     print(f"\nEvent market radius            {EVENT_RADIUS_NM} nm (flag only, "
           f"no score)")
     print(f"Sun window                     ±{SUN_WINDOW_MIN} min of sunrise/sunset")
+    print("\nInvoice (--invoice)")
+    for cls in ("turboprop", "mid_jet", "large_jet"):
+        print(f"  {cls + ' dry rate / crew day':<{w}} ${INVOICE_DRY_RATE[cls]:,}/hr · "
+              f"${INVOICE_CREW_DAY[cls]:,} at {INVOICE_CREW_DAY_MIN_BLOCK_H:g}h+ block")
+    print(f"  {'catering (jets, pax > 0)':<{w}} ${INVOICE_CATERING_PER_PAX}/pax")
+    print(f"  {'federal excise tax':<{w}} {INVOICE_FET_RATE * 100:.1f}% of charter + "
+          f"fuel, domestic only")
+    print(f"  {'Jet-A':<{w}} {JET_A_LB_PER_GAL} lb/gal")
+    print(f"Calibration warning (--calib)  miss > {CALIB_WARN_MIN:g} min on a leg "
+          f"> {CALIB_WARN_GC:g} nm GC")
     print(f"Candidates per tail (--top)    {TOP_DEFAULT} default, {TOP_MAX} max")
     print(f"Default --date                 today in {HOME_TZ}")
+
+
+# ---------------------------------------------------------------------------
+# v7.3 — the board widget (E4)
+# ---------------------------------------------------------------------------
+#
+# The RULE 1 card template lives here, not in RULES.md. Finalize fills it from
+# the same values it computes, plus the story fields Dispatch writes into each
+# pick (job, event, hook), and prints one finished widget. The session copies
+# it into the visualize tool verbatim. A template kept in one place cannot
+# drift between sessions; a template cloned by hand four times a board can.
+
+JOB_TYPES = ("Sports charter", "Corporate charter", "Entertainment charter",
+             "Freight run", "Ferry flight", "Medical charter", "VIP charter",
+             "Owner trip")
+WIDGET_MARK = "----- WIDGET (render verbatim) -----"
+HOOK_MIN_SENTENCES = 3
+
+CARD_CSS = """<style>
+.mb{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}
+.mc{max-width:320px;background:#FFFFFF;border:0.5px solid #D3D1C7;border-radius:12px;overflow:hidden;font-family:sans-serif}
+.mc-hd{padding:16px 20px 8px}
+.mc-n{font-size:11px;text-transform:uppercase;letter-spacing:0.02em;color:#888780;font-weight:400}
+.mc-tail{font-size:22px;font-weight:500;color:#2C2C2A;margin-top:2px}
+.mc-type{font-size:12px;color:#5F5E5A;margin-top:1px}
+.mc-rt{background:#F1EFE8;padding:12px 20px;display:flex;align-items:center;justify-content:space-between}
+.mc-rt-r{text-align:right}
+.mc-icao{font-size:18px;font-weight:500;color:#2C2C2A}
+.mc-city{font-size:11px;color:#888780}
+.mc-arw{color:#888780;font-size:18px}
+.mc-st{padding:16px 20px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.mc-c{background:#F1EFE8;border-radius:8px;padding:8px}
+.mc-c-dep{display:flex;align-items:center;justify-content:space-between}
+.mc-c-ses{background:#E6F1FB}
+.mc-k{font-size:11px;text-transform:uppercase;color:#888780}
+.mc-v{font-size:14px;font-weight:500;color:#2C2C2A}
+.mc-c-ses .mc-k{color:#185FA5}
+.mc-c-ses .mc-v{color:#185FA5}
+.mc-tod{font-size:16px;color:#854F0B}
+.mc-ft{padding:0 20px 20px}
+.mc-bd{display:flex;gap:6px;margin-bottom:10px}
+.mc-b{background:#F1EFE8;color:#5F5E5A;font-size:12px;padding:4px 10px;border-radius:8px}
+.mc-b-ev{background:#E6F1FB;color:#185FA5}
+.mc-hk{font-size:12px;line-height:1.7;color:#5F5E5A;margin:0 0 14px}
+.mc .mc-fly{width:100%;background:transparent;border:0.5px solid #B4B2A9;border-radius:8px;padding:10px;font-size:13px;font-weight:500;color:#2C2C2A;cursor:pointer;margin-bottom:8px}
+.mc .mc-sb{display:block;width:100%;box-sizing:border-box;text-align:center;background:transparent;border:0.5px solid #B4B2A9;border-radius:8px;padding:10px;font-size:13px;font-weight:500;color:#2C2C2A;text-decoration:none}
+.mb-foot{font-size:11px;color:#888780;margin-top:8px;font-family:sans-serif}
+</style>"""
+
+
+def story_problems(p: dict, pax: int, cargo: int) -> list:
+    """The parts of RULE 5 a script can check; the rest stays judgment."""
+    probs = []
+    job = str(p.get("job", "")).strip()
+    if job not in JOB_TYPES:
+        probs.append(f"job {job!r} is not a RULE 1 job type "
+                     f"({', '.join(JOB_TYPES)})")
+    if job == "Ferry flight" and (pax or cargo):
+        probs.append("a Ferry flight carries 0 pax and 0 cargo")
+    hook = " ".join(str(p.get("hook", "")).split())
+    n = len(re.findall(r"[.!?](?=\s|$)", hook))
+    if n < HOOK_MIN_SENTENCES:
+        probs.append(f"hook has {n} sentence(s); RULE 5 needs at least "
+                     f"{HOOK_MIN_SENTENCES}")
+    ev = str(p.get("event") or "").strip()
+    if len(ev) > 40:
+        probs.append("event badge over 40 characters; keep it concise")
+    return probs
+
+
+def _card(n: int, total: int, r: dict) -> str:
+    e = html.escape
+    badges = f'<span class="mc-b">{e(r["job"])}</span>'
+    if r["event"]:
+        badges += f'<span class="mc-b mc-b-ev">{e(r["event"])}</span>'
+    z, lcl = r["departure"].split(" / ")
+    prompt = f"I want to fly Mission {n} — {r['tail']} {r['dep']} to {r['dest']}"
+    return (
+        f'<div class="mc"><div class="mc-hd"><div class="mc-n">Mission {n} of '
+        f'{total}</div><div class="mc-tail">{e(r["tail"])}</div><div '
+        f'class="mc-type">{e(r["model"])}</div></div>'
+        f'<div class="mc-rt"><div><div class="mc-icao">{e(r["dep"])}</div><div '
+        f'class="mc-city">{e(r["dep_city"])}</div></div><i class="ti '
+        f'ti-arrow-right mc-arw" aria-hidden="true"></i><div class="mc-rt-r">'
+        f'<div class="mc-icao">{e(r["dest"])}</div><div class="mc-city">'
+        f'{e(r["dest_city"])}</div></div></div>'
+        f'<div class="mc-st"><div class="mc-c mc-c-dep"><div><div class="mc-k">'
+        f'Departure</div><div class="mc-v">{e(z)} / {e(lcl)}</div></div><i '
+        f'class="ti {r["icon"]} mc-tod" aria-hidden="true"></i></div>'
+        f'<div class="mc-c"><div class="mc-k">Block time</div><div class="mc-v">'
+        f'{r["block"]}</div></div><div class="mc-c mc-c-ses"><div class="mc-k">'
+        f'Session time</div><div class="mc-v">{r["session"]}</div></div>'
+        f'<div class="mc-c"><div class="mc-k">Passengers</div><div class="mc-v">'
+        f'{r["pax"]} pax</div></div><div class="mc-c"><div class="mc-k">Cargo'
+        f'</div><div class="mc-v">{r["cargo"]} lbs</div></div><div class="mc-c">'
+        f'<div class="mc-k">Route dist</div><div class="mc-v">{r["route_nm"]} nm'
+        f'</div></div></div>'
+        f'<div class="mc-ft"><div class="mc-bd">{badges}</div><p class="mc-hk">'
+        f'{e(r["hook"])}</p><button class="mc-fly" onclick="sendPrompt('
+        f'{e(json.dumps(prompt))})">Fly this mission ↗</button><a class="mc-sb" '
+        f'href="{e(r["simbrief"])}" target="_blank">Open in SimBrief ↗</a>'
+        f'</div></div>')
+
+
+def board_html(rows: list, calls: int | None) -> str:
+    total = len(rows)
+    cards = "\n".join(_card(i, total, r) for i, r in enumerate(rows, 1))
+    foot = (f'\n<div class="mb-foot">Board built in {calls} tool calls</div>'
+            if calls else "")
+    return f'{CARD_CSS}\n<div class="mb">\n{cards}\n</div>{foot}'
+
+
+# ---------------------------------------------------------------------------
+# v7.3 — invoice, calibration and flight logging (E6)
+# ---------------------------------------------------------------------------
+#
+# These rates used to live in RULES.md and TEMPLATES.md, the one set of numbers
+# outside this file. TEMPLATES.md now says which lines appear and in what
+# order; the amounts come from --invoice.
+JET_A_LB_PER_GAL = 6.7
+INVOICE_DRY_RATE = {"turboprop": 1500, "mid_jet": 3200, "large_jet": 6200}
+INVOICE_CREW_DAY = {"turboprop": 600, "mid_jet": 1200, "large_jet": 2500}
+INVOICE_CATERING_PER_PAX = 65
+INVOICE_CREW_DAY_MIN_BLOCK_H = 2.0
+INVOICE_FET_RATE = 0.075     # 26 USC 4261: charter and fuel, domestic legs only
+
+# --calib flags a miss worth questioning: more than this many minutes on a leg
+# longer than this many great-circle nm. Percentage is not the test at short
+# range (RULES.md → FLIGHT TIME).
+CALIB_WARN_MIN = 5.0
+CALIB_WARN_GC = 300.0
+LOGBOOK_WINDOW = 10
+
+
+def parse_block(v) -> float:
+    """'1h 46m', '1:46' or '106' (minutes) -> hours."""
+    t = str(v).strip().lower()
+    m = re.fullmatch(r"(\d+)\s*h\s*(\d+)\s*m?", t) or re.fullmatch(r"(\d+):(\d{2})", t)
+    if m:
+        return int(m.group(1)) + int(m.group(2)) / 60
+    if re.fullmatch(r"\d+", t):
+        return int(t) / 60
+    raise ValueError(f"block {v!r}: use '1h 46m', '1:46' or minutes")
+
+
+def _money(x: float) -> str:
+    return f"{x:,.2f}"
+
+
+def _cents(x: float) -> float:
+    """Round money half-up to the cent (float rounding can drop half a cent)."""
+    return float(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def invoice(args, doc, airports) -> int:
+    tail = next((f for f in doc.fleet if f["tail"].upper() == (args.tail or "").upper()), None)
+    errs = []
+    if tail is None:
+        errs.append(f"unknown tail {args.tail!r}")
+    dep = (args.dep or (tail["current"] if tail else "")).upper()
+    dest = (args.dest or "").upper()
+    for ident in (dep, dest):
+        if ident not in airports:
+            errs.append(f"{ident or '(blank)'} not in the airport database")
+    try:
+        block = parse_block(args.block)
+    except ValueError as exc:
+        errs.append(str(exc))
+        block = 0
+    for name in ("trip_fuel", "fuel_price"):
+        if getattr(args, name) is None:
+            errs.append(f"--{name.replace('_', '-')} is required")
+    if errs:
+        print(json.dumps({"problems": errs}, indent=1))
+        return 4
+    cls = tail["cls"]
+    pax = args.pax or 0
+    domestic = airports[dep]["country"] == "US" and airports[dest]["country"] == "US"
+    hrs = round(block, 2)
+    items = []
+    charter = hrs * INVOICE_DRY_RATE[cls]
+    items.append({"desc": "Aircraft charter — dry hourly rate", "qty": f"{hrs:.2f} HR",
+                  "rate": f"${_money(INVOICE_DRY_RATE[cls])}/HR",
+                  "amount": _cents(charter)})
+    gal = args.trip_fuel / JET_A_LB_PER_GAL
+    fuel = round(gal) * args.fuel_price
+    items.append({"desc": "Jet-A fuel" + (" (price estimated)" if args.fuel_est else ""),
+                  "qty": f"{round(gal):,} GAL", "rate": f"${args.fuel_price:.2f}/GAL",
+                  "amount": _cents(fuel)})
+    if cls in ("mid_jet", "large_jet") and pax > 0:
+        items.append({"desc": "In-flight catering", "qty": f"{pax} PAX",
+                      "rate": f"${INVOICE_CATERING_PER_PAX:.2f}/PAX",
+                      "amount": float(pax * INVOICE_CATERING_PER_PAX)})
+    if args.handling is not None:
+        items.append({"desc": "Ramp / handling" + (" (estimated)" if args.handling_est else ""),
+                      "qty": "—", "rate": "—", "amount": _cents(args.handling)})
+    if block >= INVOICE_CREW_DAY_MIN_BLOCK_H:
+        items.append({"desc": "Crew day rate", "qty": "1", "rate": "—",
+                      "amount": float(INVOICE_CREW_DAY[cls])})
+    if domestic:
+        fet = (_cents(charter) + _cents(fuel)) * INVOICE_FET_RATE
+        items.append({"desc": "Federal excise tax (FET)", "qty": "—",
+                      "rate": f"{INVOICE_FET_RATE * 100:.1f}%", "amount": _cents(fet)})
+    total = _cents(sum(i["amount"] for i in items))
+    for i in items:
+        i["amount_fmt"] = f"${_money(i['amount'])}"
+    print(json.dumps({"tail": tail["tail"], "class": cls, "route": f"{dep}-{dest}",
+                      "domestic": domestic, "block_hrs": f"{hrs:.2f}",
+                      "fuel_gal": round(gal), "items": items, "total": total,
+                      "total_fmt": f"${_money(total)}"}, indent=1, ensure_ascii=False))
+    return 0
+
+
+def calib(args, doc) -> int:
+    tail = next((f for f in doc.fleet if f["tail"].upper() == (args.tail or "").upper()), None)
+    need = {"gc": args.gc, "gnd": args.gnd, "air": args.air, "air-min": args.air_min}
+    errs = [f"--{k} is required" for k, v in need.items() if v is None]
+    if tail is None:
+        errs.append(f"unknown tail {args.tail!r}")
+    if errs:
+        print(json.dumps({"problems": errs}, indent=1))
+        return 4
+    lim = doc.limits_for(tail["model"])
+    still = args.air_min * args.gnd / args.air
+    model = args.gc * ROUTE_FACTOR / tail["ktas"] * 60 + overhead_h(args.gc) * 60
+    dev = (still - model) / model
+    date = (datetime.strptime(args.date, "%d%b%y") if args.date
+            else datetime.now(ZoneInfo(HOME_TZ))).strftime("%d %b %Y").upper()
+    sign = lambda x: f"{x * 100:+.1f}%".replace("-", "−")
+    row = (f"| {date} | {tail['tail']} | {tail['model']} | {tail['cls']} | "
+           f"{args.gc:g} | {args.air_min:g} | {still:.1f} | {model:.1f} | {sign(dev)} |")
+    warnings = []
+    if abs(still - model) > CALIB_WARN_MIN and args.gc > CALIB_WARN_GC:
+        warnings.append(f"still-air {still:.1f} min vs model {model:.1f} min: a "
+                        f"{abs(still - model):.1f}-minute miss on a {args.gc:g} nm "
+                        f"leg — question the {tail['model']} plan speed "
+                        f"(ARCHIVE.md → REFIT METHOD)")
+    if args.empty_weight is not None and abs(args.empty_weight - lim["bow"]) > 1:
+        warnings.append(f"OFP empty weight {args.empty_weight:g} ≠ MODEL LIMITS BOW "
+                        f"{lim['bow']:g} — check the SimBrief airframe")
+    if args.pax_weight is not None:
+        allow = PAX_ALLOWANCE_LB_OVERRIDE.get(lim["icao"], PAX_ALLOWANCE_LB)
+        if abs(args.pax_weight - allow) > 0.5:
+            warnings.append(f"OFP weight per passenger {args.pax_weight:g} ≠ the "
+                            f"script's {allow} lb for {lim['icao']}")
+    print(json.dumps({"row": row, "still_air_min": round(still, 1),
+                      "model_min": round(model, 1), "deviation": round(dev, 4),
+                      "miss_min": round(still - model, 1), "warnings": warnings},
+                     indent=1, ensure_ascii=False))
+    return 0
+
+
+def _cells(line: str) -> list:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def log_flight(args, doc, airports) -> int:
+    """Append a landed flight to THE LOGBOOK and move the tail, in place."""
+    try:
+        with open(args.log_flight, encoding="utf-8") as fh:
+            f = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"error reading {args.log_flight}: {exc}", file=sys.stderr)
+        return 3
+    errs = []
+    tail = next((t for t in doc.fleet if t["tail"].upper() == str(f.get("tail", "")).upper()), None)
+    if tail is None:
+        errs.append(f"unknown tail {f.get('tail')!r}")
+    dest = str(f.get("dest", "")).upper()
+    if dest not in airports:
+        errs.append(f"{dest or '(blank)'} not in the airport database")
+    if tail and dest == tail["current"]:
+        errs.append(f"{tail['tail']} is already at {dest}")
+    try:
+        date = datetime.strptime(str(f.get("date", "")).strip().title(), "%d %b %Y")
+    except ValueError:
+        errs.append("date must be 'DD MMM YYYY', e.g. 12 NOV 2026")
+        date = None
+    try:
+        block = fmt_hm(parse_block(f.get("block", "")))
+    except ValueError as exc:
+        errs.append(str(exc))
+        block = None
+    job = str(f.get("job", "")).strip()
+    if job not in JOB_TYPES:
+        errs.append(f"job {job!r} is not a RULE 1 job type")
+    pax = f.get("pax", 0)
+    if not isinstance(pax, int) or pax < 0:
+        errs.append("pax must be a whole number")
+    hook = " ".join(str(f.get("hook", "")).replace("|", "/").split())
+    if not hook:
+        errs.append("hook is required (a one-line summary)")
+    event = " ".join(str(f.get("event") or "—").replace("|", "/").split())
+    if errs:
+        print(json.dumps({"problems": errs}, indent=1))
+        return 4
+
+    with open(args.doc, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    dep = tail["current"]
+    new_away = 0 if dest == tail["home"] else tail["away"] + 1
+
+    # THE FLEET row for the tail: Current and Away, by column name.
+    hdr = next(i for i, l in enumerate(lines) if l.startswith("| Tail |"))
+    cols = _cells(lines[hdr])
+    ci, ai = cols.index("Current"), cols.index("Away")
+    ri = next(i for i, l in enumerate(lines)
+              if l.startswith("|") and _cells(l)[0] == tail["tail"])
+    cells = _cells(lines[ri])
+    cells[ci], cells[ai] = dest, str(new_away)
+    lines[ri] = "| " + " | ".join(cells) + " |"
+
+    # THE LOGBOOK: append, then drop the oldest beyond the window.
+    lh = next(i for i, l in enumerate(lines)
+              if l.startswith("| Date |") and "Route" in l)
+    end = lh + 2
+    while end < len(lines) and lines[end].startswith("|"):
+        end += 1
+    dstr = date.strftime("%d %b %Y").upper()
+    row = (f"| {dstr} | {tail['tail']} | {dep}-{dest} | {block} | {job} | "
+           f"{pax} | {event} | {hook} |")
+    lines.insert(end, row)
+    data = list(range(lh + 2, end + 1))
+    dropped = None
+    if len(data) > LOGBOOK_WINDOW:
+        dropped = lines.pop(data[0])
+    with open(args.doc, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+
+    # Re-parse what was written and run DATA INTEGRITY's Current check.
+    try:
+        doc2 = Doc(args.doc, args.ref)
+    except DataError as exc:
+        print(f"error: the edited state no longer parses: {exc}", file=sys.stderr)
+        return 3
+    integrity = []
+    for t in doc2.fleet:
+        rows = [r for r in doc2.logbook if r["reg"] == t["tail"]]
+        if rows and rows[-1]["dest"] != t["current"]:
+            integrity.append(f"{t['tail']}: Current {t['current']} but last logged "
+                             f"leg ends at {rows[-1]['dest']}")
+        if t["current"] == t["home"] and t["away"] != 0:
+            integrity.append(f"{t['tail']}: at home but Away {t['away']}")
+    print(json.dumps({"logged": row, "dropped": dropped,
+                      "fleet": f"{tail['tail']} Current {dep}→{dest}, Away "
+                               f"{tail['away']}→{new_away}",
+                      "manifest": doc2.manifest(airports),
+                      "integrity": integrity or "clean"}, indent=1, ensure_ascii=False))
+    return 0
 
 
 def main() -> int:
@@ -1468,6 +1847,38 @@ def main() -> int:
                              "departure airport's sun times")
     ap_arg.add_argument("--json-out", metavar="FILE",
                         help="also write the --json payload to FILE")
+    ap_arg.add_argument("--widget", action="store_true",
+                        help="with --finalize: picks carry job, event and hook; "
+                             "print the finished RULE 1 board after the JSON")
+    ap_arg.add_argument("--calls", type=int, default=None,
+                        help="with --widget: tool calls the board took, for its "
+                             "footer line")
+    ap_arg.add_argument("--log-flight", metavar="FLIGHT",
+                        help="append the landed flight in FLIGHT (JSON) to THE "
+                             "LOGBOOK and move the tail, editing --doc in place")
+    ap_arg.add_argument("--invoice", action="store_true",
+                        help="compute RULE 6 invoice lines: --tail --dest "
+                             "--block --trip-fuel --fuel-price [--pax "
+                             "--handling --dep --fuel-est --handling-est]")
+    ap_arg.add_argument("--calib", action="store_true",
+                        help="compute a CALIBRATION.md row: --tail --gc --gnd "
+                             "--air --air-min [--date --empty-weight "
+                             "--pax-weight]")
+    ap_arg.add_argument("--dep", help="--invoice: departure (default: Current)")
+    ap_arg.add_argument("--dest", help="--invoice: destination")
+    ap_arg.add_argument("--block", help="--invoice: OFP planned block (1h 46m)")
+    ap_arg.add_argument("--trip-fuel", type=float, help="--invoice: OFP trip fuel, lb")
+    ap_arg.add_argument("--fuel-price", type=float, help="--invoice: $/gal at departure FBO")
+    ap_arg.add_argument("--fuel-est", action="store_true", help="--invoice: price is an estimate")
+    ap_arg.add_argument("--pax", type=int, help="--invoice: passengers")
+    ap_arg.add_argument("--handling", type=float, help="--invoice: ramp/handling $")
+    ap_arg.add_argument("--handling-est", action="store_true", help="--invoice: handling is an estimate")
+    ap_arg.add_argument("--gc", type=float, help="--calib: OFP great-circle nm")
+    ap_arg.add_argument("--gnd", type=float, help="--calib: OFP ground (route) nm")
+    ap_arg.add_argument("--air", type=float, help="--calib: OFP air nm")
+    ap_arg.add_argument("--air-min", type=float, help="--calib: OFP OFF–ON minutes")
+    ap_arg.add_argument("--empty-weight", type=float, help="--calib: OFP empty weight, lb")
+    ap_arg.add_argument("--pax-weight", type=float, help="--calib: OFP weight per passenger, lb")
     ap_arg.add_argument("--finalize", metavar="PICKS",
                         help="compute card fields and finished SimBrief URLs "
                              "for the story picks in PICKS (a JSON file)")
@@ -1476,7 +1887,8 @@ def main() -> int:
         print(f"version mismatch: RULES {args.expect}, script {SCRIPT_VERSION} — "
               f"fetch the matching script or reload RULES.md", file=sys.stderr)
         return 5
-    if args.hours is None:
+    utility = args.log_flight or args.invoice or args.calib
+    if args.hours is None and not utility:
         ap_arg.error("--hours is required")
     if args.top is not None and not 1 <= args.top <= TOP_MAX:
         ap_arg.error(f"--top must be between 1 and {TOP_MAX}")
@@ -1518,6 +1930,12 @@ def main() -> int:
         pass
     manifest += f" · run {run_no}"
 
+    if args.log_flight:
+        return log_flight(args, doc, airports)
+    if args.invoice:
+        return invoice(args, doc, airports)
+    if args.calib:
+        return calib(args, doc)
     if args.finalize:
         try:
             from timezonefinder import TimezoneFinder

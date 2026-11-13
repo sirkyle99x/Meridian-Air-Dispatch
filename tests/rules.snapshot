@@ -1,4 +1,4 @@
-Meridian Air Dispatch — active scoring constants · script v7.2 · state schema 6.4
+Meridian Air Dispatch — active scoring constants · script v7.3 · state schema 6.4
 
 Timing
   route factor                   x1.07
@@ -47,5 +47,14 @@ Destination quality (airport `type` is deliberately not scored)
 
 Event market radius            50 nm (flag only, no score)
 Sun window                     ±45 min of sunrise/sunset
+
+Invoice (--invoice)
+  turboprop dry rate / crew day  $1,500/hr · $600 at 2h+ block
+  mid_jet dry rate / crew day    $3,200/hr · $1,200 at 2h+ block
+  large_jet dry rate / crew day  $6,200/hr · $2,500 at 2h+ block
+  catering (jets, pax > 0)       $65/pax
+  federal excise tax             7.5% of charter + fuel, domestic only
+  Jet-A                          6.7 lb/gal
+Calibration warning (--calib)  miss > 5 min on a leg > 300 nm GC
 Candidates per tail (--top)    12 default, 30 max
 Default --date                 today in America/New_York

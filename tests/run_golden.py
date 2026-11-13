@@ -370,6 +370,82 @@ for _ in range(2):
 check("G27", "run counter counts runs per working directory",
       outs[0].endswith("run 1") and outs[1].endswith("run 2"), " | ".join(outs))
 
+# ---- v7.3 (Phase 6) -------------------------------------------------------
+
+HOOK = ("Coastline Beverage's team flies home after the November tastings. "
+        "Dana Whitfield wants them in Long Beach before Monday. "
+        "The sun sets over the Mojave on the way.")
+
+# G28 --widget: finished board, escaped, validated story fields
+pk = [{"tail": "N610CD", "dest": "KLGB", "dep_local": "16:30", "pax": 5, "cargo": 40,
+       "date": "12NOV26", "job": "Corporate charter", "event": "Fiesta <Week>",
+       "hook": HOOK}]
+path = os.path.join(TMP, "w.json")
+json.dump(pk, open(path, "w"))
+rc, out, _ = run("--finalize", path, "--hours", "2.5", "--widget", "--calls", "6")
+wid = out.split("----- WIDGET (render verbatim) -----", 1)[1] if "WIDGET" in out else ""
+ok1 = (rc == 0 and wid.count('class="mc"') == 1 and "Mission 1 of 1" in wid
+       and "2330Z / 16:30 LCL" in wid and "ti-sunset" in wid
+       and "Fiesta &lt;Week&gt;" in wid and "Board built in 6 tool calls" in wid
+       and "pax=5&amp;cargo=0.04" in wid and "{" not in wid.split("</style>")[1])
+bad = [dict(pk[0], job="Charter flight", hook="Too short."),
+       dict(pk[0], job="Ferry flight")]
+json.dump(bad, open(path, "w"))
+rc2, out2, _ = run("--finalize", path, "--hours", "2.5", "--widget")
+check("G28", "--widget renders an escaped board; bad job, short hook, loaded ferry rejected",
+      ok1 and rc2 == 4 and "WIDGET" not in out2 and "not a RULE 1 job type" in out2
+      and "hook has 1 sentence" in out2 and "Ferry flight carries 0 pax" in out2,
+      f"ok1={ok1} rc2={rc2}")
+
+# G29 --log-flight on a scratch copy: row, window, fleet, integrity, re-parse
+st = os.path.join(TMP, "log.md")
+shutil.copy(STATE, st)
+fl = os.path.join(TMP, "f.json")
+outs = []
+for i, d in enumerate(["KLGB", "KSAF", "KLGB", "KSAF", "KLGB"], 1):
+    json.dump({"tail": "N610CD", "dest": d, "date": f"1{i} NOV 2026", "block": "1h 46m",
+               "job": "Corporate charter", "pax": 4, "event": "",
+               "hook": "November test leg"}, open(fl, "w"))
+    outs.append(run("--doc", st, "--log-flight", fl))
+last = json.loads(outs[-1][1]) if outs[-1][0] == 0 else {}
+d2 = dc.Doc(st)
+t2 = next(f for f in d2.fleet if f["tail"] == "N610CD")
+check("G29", "--log-flight: 5 legs → window of 10, oldest dropped, Away 0 at home, clean",
+      all(o[0] == 0 for o in outs) and len(d2.logbook) == 10
+      and d2.logbook[0]["reg"] == "N988RS" and last.get("dropped")
+      and t2["current"] == "KLGB" and t2["away"] == 0 and last.get("integrity") == "clean"
+      and "November test leg" in open(st).read() and "| 15 NOV 2026 |" in open(st).read(),
+      f"{[o[0] for o in outs]} {len(d2.logbook)} {t2['current']}/{t2['away']}")
+
+# G30 --invoice: lines, order, omission rules, half-up cents
+rc, out, _ = run("--invoice", "--tail", "N610CD", "--dest", "KLGB", "--block", "1h 46m",
+                 "--trip-fuel", "3350", "--fuel-price", "7.25", "--pax", "5",
+                 "--handling", "350")
+inv = json.loads(out) if rc == 0 else {}
+descs = [i["desc"] for i in inv.get("items", [])]
+rc2, out2, _ = run("--invoice", "--tail", "N737GG", "--dest", "MYNN", "--block", "2:10",
+                   "--trip-fuel", "9000", "--fuel-price", "7", "--pax", "0")
+inv2 = json.loads(out2) if rc2 == 0 else {}
+d2s = [i["desc"] for i in inv2.get("items", [])]
+check("G30", "--invoice: mid jet domestic $10,660.68; BBJ to Nassau gets crew day, no FET/catering",
+      inv.get("total_fmt") == "$10,660.68"
+      and descs == ["Aircraft charter — dry hourly rate", "Jet-A fuel", "In-flight catering",
+                    "Ramp / handling", "Federal excise tax (FET)"]
+      and d2s == ["Aircraft charter — dry hourly rate", "Jet-A fuel", "Crew day rate"]
+      and inv2.get("domestic") is False, f"{inv.get('total_fmt')} {d2s}")
+
+# G31 --calib reproduces logged rows and flags a real miss
+rc, out, _ = run("--calib", "--tail", "N610CD", "--gc", "605", "--gnd", "626",
+                 "--air", "580", "--air-min", "81", "--date", "30SEP26")
+c1 = json.loads(out) if rc == 0 else {}
+rc, out, _ = run("--calib", "--tail", "N388BB", "--gc", "2082", "--gnd", "2131",
+                 "--air", "2307", "--air-min", "347", "--date", "23SEP26")
+c2 = json.loads(out) if rc == 0 else {}
+check("G31", "--calib: KLGB–KSAF row matches the log; Falcon KTEB–KSEA flagged as a miss",
+      c1.get("row") == "| 30 SEP 2026 | N610CD | Citation X | mid_jet | 605 | 81 | 87.4 | 90.7 | −3.6% |"
+      and not c1.get("warnings") and c2.get("warnings"),
+      f"{c1.get('row')} | {c2.get('row')} {c2.get('warnings')}")
+
 failed = [g for g, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed"
       + (f" · failed: {', '.join(failed)}" if failed else ""))
